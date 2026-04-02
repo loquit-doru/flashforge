@@ -113,6 +113,20 @@ cp .env.example .env
 # Set GEMINI_API_KEY (recommended, free)
 ```
 
+### Download FoxMQ Binary
+
+FoxMQ is not included in the repo (it's a 13 MB binary). Download it before the first run:
+
+```bash
+# Windows (PowerShell)
+Invoke-WebRequest -Uri "https://github.com/tashigit/foxmq/releases/download/v0.3.1/foxmq_0.3.1_windows-amd64.zip" -OutFile foxmq.zip; Expand-Archive foxmq.zip .; Remove-Item foxmq.zip
+
+# Linux
+curl -fsSL https://github.com/tashigit/foxmq/releases/download/v0.3.1/foxmq_0.3.1_linux-amd64.tar.gz | tar -xz && chmod +x foxmq
+```
+
+Or use Docker Compose — it downloads the binary automatically.
+
 ### Run (5 terminals)
 
 ```bash
@@ -175,7 +189,8 @@ PROMPT="Build a portfolio for a photographer" docker compose run --rm injector
 ## Security
 
 - HMAC-SHA256 on every swarm message (tampering → drop)
-- Nonce replay prevention (bounded ring buffer, 1024 entries)
+- Nonce replay prevention (bounded ring buffer, 10,000 entries, FIFO eviction)
+- Timestamp TTL: messages older than 2 minutes are dropped (independent of nonce check)
 - Chain hash linkage in PoC log (edit any entry → chain breaks)
 - Idempotency on job commits (duplicate COMMITs → ignored)
 - FoxMQ Vertex BFT consensus — fair message ordering, no front-running
