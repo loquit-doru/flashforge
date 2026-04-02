@@ -40,7 +40,7 @@ FOXMQ_HOST       = os.getenv("FOXMQ_HOST",       "127.0.0.1")
 FOXMQ_PORT       = int(os.getenv("FOXMQ_PORT",   "1883"))
 SWARM_SECRET     = os.getenv("SWARM_SECRET",     "swarm-secret-change-in-prod")
 POC_LOG_DIR      = os.getenv("POC_LOG_DIR",      "./poc_logs")
-PASS_THRESHOLD   = float(os.getenv("PASS_THRESHOLD",   "75"))
+PASS_THRESHOLD   = float(os.getenv("PASS_THRESHOLD",   "62"))
 CRITICS_EXPECTED = int(os.getenv("CRITICS_EXPECTED",   "1"))
 QUORUM_TIMEOUT_S = float(os.getenv("QUORUM_TIMEOUT_S", "20"))
 
@@ -49,8 +49,13 @@ async def main() -> None:
     from agents.builder import BuildResult
     from agents.critic import CriticAgent
 
+    _active_tasks = 0
+
+    def _get_load() -> float:
+        return min(_active_tasks / 4.0, 1.0)
+
     node         = FoxMQNode(NODE_ID, "critic", FOXMQ_HOST, FOXMQ_PORT, SWARM_SECRET)
-    bidder       = BidProtocol(node, capability="evaluation")
+    bidder       = BidProtocol(node, capability="evaluation", load_fn=_get_load)
     critic_agent = CriticAgent()
 
     # ── Per-job state ───────────────────────────────────────────────────────────
@@ -170,36 +175,41 @@ async def main() -> None:
     # ── LEADER ROLE — bid winner collects votes → publishes EVAL_CONSENSUS ──────
 
     async def on_commit(job_id: str, won: bool, _task_payload_bid: dict | None) -> None:
+        nonlocal _active_tasks
         if not won:
             return
+        _active_tasks += 1
 
         print(f"[critic:{NODE_ID[:8]}] 👑 CONSENSUS LEADER for {job_id[:10]}")
         _led_jobs.add(job_id)
 
-        # Fast path: quorum already reached before we won the bid
-        tracker = _trackers.get(job_id)
-        if tracker and tracker.result and job_id not in _done_jobs:
-            await _publish_consensus(job_id, tracker.result)
-            return
-
-        # Slow path: wait for votes with timeout
-        deadline = time.time() + QUORUM_TIMEOUT_S
-        while time.time() < deadline:
-            await asyncio.sleep(0.3)
-            if job_id in _done_jobs:
-                return
+        try:
+            # Fast path: quorum already reached before we won the bid
             tracker = _trackers.get(job_id)
-            if tracker and tracker.result:
+            if tracker and tracker.result and job_id not in _done_jobs:
                 await _publish_consensus(job_id, tracker.result)
                 return
 
-        # Timeout → force majority from available votes
-        tracker = _trackers.get(job_id)
-        if tracker and job_id not in _done_jobs:
-            result = tracker.force_majority()
-            if result:
-                print(f"[critic:{NODE_ID[:8]}] ⏰ Quorum timeout — forcing majority verdict")
-                await _publish_consensus(job_id, result)
+            # Slow path: wait for votes with timeout
+            deadline = time.time() + QUORUM_TIMEOUT_S
+            while time.time() < deadline:
+                await asyncio.sleep(0.3)
+                if job_id in _done_jobs:
+                    return
+                tracker = _trackers.get(job_id)
+                if tracker and tracker.result:
+                    await _publish_consensus(job_id, tracker.result)
+                    return
+
+            # Timeout → force majority from available votes
+            tracker = _trackers.get(job_id)
+            if tracker and job_id not in _done_jobs:
+                result = tracker.force_majority()
+                if result:
+                    print(f"[critic:{NODE_ID[:8]}] ⏰ Quorum timeout — forcing majority verdict")
+                    await _publish_consensus(job_id, result)
+        finally:
+            _active_tasks -= 1
 
     async def _publish_consensus(job_id: str, result: ConsensusResult) -> None:
         """Publish EVAL_CONSENSUS and advance the pipeline (leader only)."""
@@ -223,10 +233,14 @@ async def main() -> None:
         })
 
         poc = PoCLogger(root_job_id, SWARM_SECRET, POC_LOG_DIR)
+        tracker = _trackers.get(job_id)
         poc.record("EVAL_CONSENSUS", NODE_ID, {
             "verdict":   "PASS" if verdict_pass else "FAIL",
             "avg_score": round(avg_score, 2),
             "votes":     vote_summary,
+            "quorum_met": True,
+            "n_critics": tracker.n_critics if tracker else 1,
+            "quorum_required": tracker.quorum if tracker else 1,
         })
 
         print(

@@ -29,5 +29,5 @@ if __name__ == "__main__":
         print(f"❌ File not found: {args.log_path}")
         sys.exit(1)
 
-    ok = verify_poc_log(args.log_path, args.secret)
-    sys.exit(0 if ok else 1)
+    result = verify_poc_log(args.log_path, args.secret)
+    sys.exit(0 if result["valid"] else 1)

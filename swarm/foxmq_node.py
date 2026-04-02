@@ -25,13 +25,15 @@ import json
 import os
 import time
 import uuid
+from collections import deque
 from typing import Any, Callable, Dict, List, Optional
 
 import paho.mqtt.client as mqtt
 
 HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats
 PEER_STALE_AFTER   = float(os.getenv("PEER_STALE_AFTER", "10"))  # seconds without heartbeat → marked stale
-NONCE_RING_MAX     = 1024    # max nonces kept for replay prevention
+NONCE_RING_MAX     = 10_000  # max nonces kept for replay prevention (deque auto-evicts oldest)
+MSG_TTL_MS         = 120_000 # messages older than 2 minutes are dropped (replay attack mitigation)
 
 
 class FoxMQNode:
@@ -69,7 +71,7 @@ class FoxMQNode:
 
         self._handlers: Dict[str, List[Callable]] = {}
         self._peer_states: Dict[str, Dict]        = {}
-        self._seen_nonces: List[str]              = []
+        self._seen_nonces: deque                  = deque(maxlen=NONCE_RING_MAX)
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._connected: Optional[asyncio.Event]        = None  # created in start()
@@ -137,18 +139,27 @@ class FoxMQNode:
         if msg.get("sender_id") == self.node_id:
             return
 
+        # Timestamp TTL — drop messages older than MSG_TTL_MS (anti-replay hardening)
+        now_ms = int(time.time() * 1000)
+        msg_ts = msg.get("timestamp_ms", 0)
+        if abs(now_ms - msg_ts) > MSG_TTL_MS:
+            print(
+                f"[{self.role}] ⚠ TTL EXPIRED from {msg.get('sender_id', '?')[:8]} "
+                f"— age={abs(now_ms - msg_ts)}ms > {MSG_TTL_MS}ms — dropped"
+            )
+            return
+
         # HMAC verification
         if not self._verify(msg):
             print(f"[{self.role}] ⚠ HMAC FAIL from {msg.get('sender_id', '?')[:8]} — dropped")
             return
 
-        # Replay prevention
+        # Replay prevention — nonce ring + TTL window double-guard
+        # Ring buffer holds 10k nonces; TTL ensures old nonces beyond buffer are also rejected.
         nonce: str = msg.get("nonce", "")
         if nonce in self._seen_nonces:
             return
         self._seen_nonces.append(nonce)
-        if len(self._seen_nonces) > NONCE_RING_MAX:
-            self._seen_nonces = self._seen_nonces[-NONCE_RING_MAX // 2:]
 
         # Update live peer registry
         sender_id: str = msg["sender_id"]

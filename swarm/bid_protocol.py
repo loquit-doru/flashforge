@@ -21,7 +21,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
 
-COMMIT_WINDOW_MS = 500   # ms to collect bids before evaluating winner
+COMMIT_WINDOW_MS  = 500    # ms to collect bids before evaluating winner
+ORPHAN_TIMEOUT_S  = 30.0   # seconds after commit window with no COMMIT → re-announce
+ORPHAN_MAX_RETRY  = 3      # max re-announcement attempts before giving up
 
 
 @dataclass
@@ -76,6 +78,8 @@ class BidProtocol:
         self._committed_jobs: Set[str] = set()
 
         self._commit_callbacks: List[CommitCallback] = []
+        # job_id → retry count (for orphan re-announcement)
+        self._orphan_retries: Dict[str, int] = {}
 
         # Wire up handlers on the node
         node.on("TASK_AVAILABLE", self._handle_task)
@@ -105,7 +109,15 @@ class BidProtocol:
             "announced_at_ms": int(time.time() * 1000),
         }
         self._task_payloads[job_id] = payload
+        self._orphan_retries[job_id] = 0
         await self.node.publish("TASK_AVAILABLE", payload)
+
+        # Schedule orphan recovery: if no COMMIT seen after window + timeout, re-announce
+        loop = asyncio.get_event_loop()
+        loop.call_later(
+            COMMIT_WINDOW_MS / 1000 + ORPHAN_TIMEOUT_S,
+            lambda: asyncio.create_task(self._check_orphan(job_id, payload)),
+        )
         return job_id
 
     # ── Handlers ───────────────────────────────────────────────────────────────
@@ -207,3 +219,32 @@ class BidProtocol:
         task_payload = self._task_payloads.get(job_id)
         for cb in self._commit_callbacks:
             asyncio.create_task(cb(job_id, True, task_payload))
+
+    async def _check_orphan(self, job_id: str, payload: Dict[str, Any]) -> None:
+        """Re-announce a task if no COMMIT was seen within the orphan timeout window."""
+        if job_id in self._committed_jobs:
+            return  # already handled — not an orphan
+
+        retries = self._orphan_retries.get(job_id, 0)
+        if retries >= ORPHAN_MAX_RETRY:
+            print(
+                f"[{self.node.role}] ✗ Job {job_id[:8]} orphaned after "
+                f"{ORPHAN_MAX_RETRY} retries — giving up"
+            )
+            return
+
+        self._orphan_retries[job_id] = retries + 1
+        print(
+            f"[{self.node.role}] ↺ Orphan detected — re-announcing job "
+            f"{job_id[:8]} (attempt {retries + 1}/{ORPHAN_MAX_RETRY})"
+        )
+        # Clear stale bids so the new window starts fresh
+        self._pending_bids.pop(job_id, None)
+
+        await self.node.publish("TASK_AVAILABLE", payload)
+
+        loop = asyncio.get_event_loop()
+        loop.call_later(
+            COMMIT_WINDOW_MS / 1000 + ORPHAN_TIMEOUT_S,
+            lambda: asyncio.create_task(self._check_orphan(job_id, payload)),
+        )

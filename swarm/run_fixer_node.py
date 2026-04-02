@@ -42,13 +42,20 @@ async def main() -> None:
     from agents.critic import EvaluationResult, EvaluationScores
     from agents.fixer import FixerAgent
 
+    _active_tasks = 0
+
+    def _get_load() -> float:
+        return min(_active_tasks / 4.0, 1.0)
+
     node = FoxMQNode(NODE_ID, "fixer", FOXMQ_HOST, FOXMQ_PORT, SWARM_SECRET)
-    bidder = BidProtocol(node, capability="fixing")
+    bidder = BidProtocol(node, capability="fixing", load_fn=_get_load)
     fixer = FixerAgent()
 
     async def on_commit(job_id: str, won: bool, task_payload: dict | None) -> None:
+        nonlocal _active_tasks
         if not won or task_payload is None:
             return
+        _active_tasks += 1
 
         prompt: str = task_payload.get("prompt", "")
         ctx: dict = task_payload.get("context", {})
@@ -115,6 +122,8 @@ async def main() -> None:
         except Exception as exc:
             print(f"[fixer]   ✗ Fix failed: {exc}")
             poc.record("FIX_FAILED", NODE_ID, {"error": str(exc)})
+        finally:
+            _active_tasks -= 1
 
     bidder.on_commit(on_commit)
     await node.start()

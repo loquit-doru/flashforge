@@ -15,6 +15,7 @@ Use verify_poc_log() to independently verify a completed log.
 import hashlib
 import hmac as _hmac_mod
 import json
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -90,24 +91,50 @@ class PoCLogger:
         self._chain_hash = entry["hmac"]
         self._seq += 1
 
+        line = json.dumps(entry, separators=(",", ":")) + "\n"
         with open(self._log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+            f.write(line)
+            f.flush()
+            os.fsync(f.fileno())
 
         return entry
 
-    def finalize(self, signers: List[str]) -> Dict[str, Any]:
+    def finalize(
+        self,
+        signers: List[str],
+        signer_secrets: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
         """
-        Append a COORDINATION_COMPLETE summary entry and return it.
+        Append a COORDINATION_COMPLETE summary entry with multi-signer attestation.
 
-        signers: list of node_ids or roles that contributed to this job.
+        signers:        list of node_ids or roles that contributed to this job.
+        signer_secrets: optional dict {signer_id: per-agent HMAC secret} for
+                        multi-signer verification.  Each signer independently
+                        signs the chain_root, proving they attest to the full log.
+                        If not provided, falls back to shared-secret attestation.
         """
+        # Collect per-signer attestation signatures over the chain root
+        attestations: Dict[str, str] = {}
+        chain_root = self._chain_hash
+        for signer_id in signers:
+            if signer_secrets and signer_id in signer_secrets:
+                key = signer_secrets[signer_id].encode()
+            else:
+                key = self._secret  # shared secret fallback
+            attestations[signer_id] = _hmac_mod.new(
+                key,
+                f"{self.job_id}:{chain_root}:{signer_id}".encode(),
+                hashlib.sha256,
+            ).hexdigest()
+
         return self.record(
             "COORDINATION_COMPLETE",
             actor="swarm",
             data={
                 "signers": signers,
                 "total_events": self._seq,
-                "chain_root": self._chain_hash,
+                "chain_root": chain_root,
+                "attestations": attestations,
             },
         )
 
@@ -130,19 +157,38 @@ class PoCLogger:
 
 # ── Standalone verifier ────────────────────────────────────────────────────────
 
-def verify_poc_log(log_path: str, secret: str) -> bool:
+def verify_poc_log(log_path: str, secret: str, verbose: bool = True) -> Dict[str, Any]:
     """
     Re-compute and verify every HMAC + chain link in a PoC log file.
 
-    Returns True if the log is intact, False if any tampering is detected.
-    Prints a human-readable report for each entry.
+    Returns a structured verification report::
+
+        {
+            "valid": bool,
+            "entries": [ {"seq":0, "event":"...", "hmac_ok":True, "chain_ok":True, "ts_ok":True}, ... ],
+            "chain_intact": bool,
+            "timestamps_monotonic": bool,
+            "attestations_valid": bool | None,
+            "total_entries": int,
+            "stages": { "planning": {"actor":"...", "duration_s":2.4}, ... },
+            "total_time_s": float,
+        }
     """
     secret_bytes = secret.encode()
     prev_chain = ""
     ok = True
+    entries_report: List[Dict[str, Any]] = []
+    timestamps: List[int] = []
+    stages: Dict[str, Dict[str, Any]] = {}
+    first_ts: Optional[int] = None
+    last_ts: Optional[int] = None
+    chain_intact = True
+    ts_monotonic = True
+    attestations_valid: Optional[bool] = None
 
-    print(f"\n🔍 Verifying PoC log: {log_path}")
-    print("─" * 60)
+    if verbose:
+        print(f"\n🔍 Verifying PoC log: {log_path}")
+        print("─" * 60)
 
     with open(log_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -152,24 +198,111 @@ def verify_poc_log(log_path: str, secret: str) -> bool:
             entry = json.loads(line)
             seq = entry.get("seq", "?")
             event = entry.get("event", "?")
+            actor = entry.get("actor", "?")
+            ts = entry.get("timestamp_ms", 0)
+
+            entry_ok = {"seq": seq, "event": event, "actor": actor, "hmac_ok": False, "chain_ok": False, "ts_ok": True}
+
+            # Track timestamps for monotonicity + stage timing
+            if first_ts is None:
+                first_ts = ts
+            if timestamps and ts < timestamps[-1]:
+                ts_monotonic = False
+                entry_ok["ts_ok"] = False
+                if verbose:
+                    print(f"  ⚠ seq {seq} [{event}] TIMESTAMP OUT OF ORDER ({ts} < {timestamps[-1]})")
+            timestamps.append(ts)
+            last_ts = ts
+
+            # Track stage durations
+            if event == "PLAN_READY":
+                stages["planning"] = {"actor": actor, "duration_s": round((ts - first_ts) / 1000, 2) if first_ts else 0}
+            elif event == "BUILD_COMPLETE":
+                build_start = stages.get("building", {}).get("_start_ts", first_ts or ts)
+                stages["building"] = {"actor": actor, "duration_s": round((ts - build_start) / 1000, 2)}
+            elif event == "BUILD_STARTED":
+                stages.setdefault("building", {})["_start_ts"] = ts
+                stages["building"]["actor"] = actor
+            elif event == "EVAL_CONSENSUS":
+                eval_start = stages.get("building", {}).get("_end_ts", ts)
+                stages["evaluation"] = {"actor": actor, "duration_s": round((ts - (stages.get("building", {}).get("_start_ts", ts))) / 1000, 2)}
 
             # 1. Chain link
             if entry.get("prev_chain") != prev_chain:
-                print(f"  ✗ seq {seq} [{event}] CHAIN BREAK")
+                chain_intact = False
                 ok = False
+                entry_ok["chain_ok"] = False
+                if verbose:
+                    print(f"  ✗ seq {seq} [{event}] CHAIN BREAK")
             else:
+                entry_ok["chain_ok"] = True
                 # 2. HMAC
                 stored_hmac = entry.get("hmac", "")
                 body = {k: v for k, v in entry.items() if k != "hmac"}
                 canonical = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
                 computed = _hmac_mod.new(secret_bytes, canonical, hashlib.sha256).hexdigest()
                 if _hmac_mod.compare_digest(stored_hmac, computed):
-                    print(f"  ✓ seq {seq:>3} [{event}]  actor={entry.get('actor')}")
+                    entry_ok["hmac_ok"] = True
                     prev_chain = stored_hmac
+                    if verbose:
+                        print(f"  ✓ seq {seq:>3} [{event}]  actor={actor}")
                 else:
-                    print(f"  ✗ seq {seq} [{event}] HMAC MISMATCH — TAMPERED")
                     ok = False
+                    if verbose:
+                        print(f"  ✗ seq {seq} [{event}] HMAC MISMATCH — TAMPERED")
 
-    print("─" * 60)
-    print(f"  {'✅ Log VALID — coordination proof intact.' if ok else '❌ Log INVALID — tampering detected.'}")
-    return ok
+            # 3. Verify multi-signer attestations on COORDINATION_COMPLETE
+            if event == "COORDINATION_COMPLETE":
+                data = entry.get("data", {})
+                attestations = data.get("attestations", {})
+                if attestations:
+                    attestations_valid = True
+                    chain_root = data.get("chain_root", "")
+                    job_id = entry.get("job_id", "")
+                    for signer_id, sig in attestations.items():
+                        expected = _hmac_mod.new(
+                            secret_bytes,
+                            f"{job_id}:{chain_root}:{signer_id}".encode(),
+                            hashlib.sha256,
+                        ).hexdigest()
+                        if not _hmac_mod.compare_digest(sig, expected):
+                            attestations_valid = False
+                            ok = False
+                            if verbose:
+                                print(f"  ✗ Attestation INVALID for signer: {signer_id}")
+                        elif verbose:
+                            print(f"  ✓ Attestation valid: {signer_id}")
+
+            entries_report.append(entry_ok)
+
+    # Clean up internal tracking keys from stages
+    for stage_data in stages.values():
+        stage_data.pop("_start_ts", None)
+        stage_data.pop("_end_ts", None)
+
+    total_time = round((last_ts - first_ts) / 1000, 2) if first_ts and last_ts else 0
+
+    if verbose:
+        print("─" * 60)
+        if ok:
+            print(f"  ✅ Log VALID — coordination proof intact.")
+        else:
+            print(f"  ❌ Log INVALID — tampering detected.")
+        print(f"  📊 {len(entries_report)} events | chain={'✓' if chain_intact else '✗'} "
+              f"| timestamps={'✓ monotonic' if ts_monotonic else '✗ out-of-order'} "
+              f"| attestations={'✓' if attestations_valid else ('✗' if attestations_valid is False else 'N/A')}")
+        if stages:
+            stage_parts = [f"{k}: {v.get('duration_s', 0)}s" for k, v in stages.items()]
+            print(f"  ⏱  Stages: {', '.join(stage_parts)}")
+        print(f"  ⏱  Total: {total_time}s")
+
+    return {
+        "valid": ok,
+        "entries": entries_report,
+        "chain_intact": chain_intact,
+        "timestamps_monotonic": ts_monotonic,
+        "attestations_valid": attestations_valid,
+        "total_entries": len(entries_report),
+        "stages": stages,
+        "total_time_s": total_time,
+    }

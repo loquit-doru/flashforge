@@ -38,16 +38,23 @@ async def main() -> None:
     from agents.planner import ImplementationPlan
     from agents.builder import BuilderAgent
 
+    _active_tasks = 0
+
+    def _get_load() -> float:
+        return min(_active_tasks / 4.0, 1.0)
+
     node = FoxMQNode(NODE_ID, "builder", FOXMQ_HOST, FOXMQ_PORT, SWARM_SECRET)
-    bidder = BidProtocol(node, capability="building")
+    bidder = BidProtocol(node, capability="building", load_fn=_get_load)
     builder = BuilderAgent()
 
     # job_id of build task → original job_id (for PoC log continuity)
     build_to_root: dict[str, str] = {}
 
     async def on_commit(job_id: str, won: bool, task_payload: dict | None) -> None:
+        nonlocal _active_tasks
         if not won or task_payload is None:
             return
+        _active_tasks += 1
 
         prompt: str = task_payload.get("prompt", "Build a web app")
         ctx: dict = task_payload.get("context", {})
@@ -96,6 +103,8 @@ async def main() -> None:
         except Exception as exc:
             print(f"[builder] ✗ Build failed: {exc}")
             poc.record("BUILD_FAILED", NODE_ID, {"error": str(exc)})
+        finally:
+            _active_tasks -= 1
 
     bidder.on_commit(on_commit)
     await node.start()

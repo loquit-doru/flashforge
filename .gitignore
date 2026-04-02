@@ -45,6 +45,13 @@ env/
 output/
 temp/
 *.zip
+swarm_output/
+poc_logs/
+
+# FoxMQ binary and private key material (user must download separately)
+foxmq.exe
+foxmq
+foxmq.d/
 
 # Logs
 *.log
@@ -70,7 +77,9 @@ notes.md
 TODO.md
 
 # Temp scripts & debug files
-_*.py
+_[a-z]*.py
+_*.md
+_*.html
 analyze_*.py
 simulate_*.py
 sim_output/
@@ -81,18 +90,13 @@ run_single_job.py
 set_avatar.py
 setup_profile.py
 *.jpg
+*.jpg.jpg
 agent.log
 .coverage
+retrospective.md
 
 # Tests (internal)
 tests/
 
-# ============================================
-# Core source (private — not published)
-# ============================================
-main.py
-config.py
+# Seedstr private key (not published)
 seedstr_client.py
-agents/
-utils/
-demo.py

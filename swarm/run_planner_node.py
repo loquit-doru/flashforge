@@ -35,13 +35,20 @@ POC_LOG_DIR = os.getenv("POC_LOG_DIR", "./poc_logs")
 async def main() -> None:
     from agents.planner import PlannerAgent
 
+    _active_tasks = 0
+
+    def _get_load() -> float:
+        return min(_active_tasks / 4.0, 1.0)
+
     node = FoxMQNode(NODE_ID, "planner", FOXMQ_HOST, FOXMQ_PORT, SWARM_SECRET)
-    bidder = BidProtocol(node, capability="planning")
+    bidder = BidProtocol(node, capability="planning", load_fn=_get_load)
     planner = PlannerAgent()
 
     async def on_commit(job_id: str, won: bool, task_payload: dict | None) -> None:
+        nonlocal _active_tasks
         if not won or task_payload is None:
             return
+        _active_tasks += 1
 
         prompt: str = task_payload.get("prompt", "Build a web app")
         print(f"[planner] 🏆 Won job {job_id[:8]} — analysing: {prompt[:60]!r}")
@@ -70,6 +77,8 @@ async def main() -> None:
         except Exception as exc:
             print(f"[planner] ✗ Planning failed: {exc}")
             poc.record("PLAN_FAILED", NODE_ID, {"error": str(exc)})
+        finally:
+            _active_tasks -= 1
 
     bidder.on_commit(on_commit)
     await node.start()

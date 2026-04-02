@@ -119,7 +119,9 @@ async def main(prompt: str, timeout_s: int) -> None:
                     print(f"\n✅ Coordination complete in {elapsed:.1f}s")
                     print(f"   PoC log : {poc_path}")
                     print(f"\n🔍 Verifying Proof of Coordination…")
-                    verify_poc_log(poc_path, SWARM_SECRET)
+                    result = verify_poc_log(poc_path, SWARM_SECRET)
+                    if not result["valid"]:
+                        print("  ⚠ Verification found issues — see report above")
                     done_event.set()
                     break
         except Exception:
