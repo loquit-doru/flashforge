@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from swarm.foxmq_node import FoxMQNode
 from swarm.bid_protocol import BidProtocol
 from swarm.poc_logger import PoCLogger
+from swarm.hive_memory import make_hive_payload, HIVE_TOPIC
 
 NODE_ID = os.getenv("NODE_ID", f"builder-{uuid.uuid4().hex[:8]}")
 FOXMQ_HOST = os.getenv("FOXMQ_HOST", "127.0.0.1")
@@ -98,6 +99,20 @@ async def main() -> None:
                 },
                 job_id=f"{root_job_id}:eval",
             )
+
+            # Publish to Hive Memory — share build artifact metadata
+            await node.publish(HIVE_TOPIC, make_hive_payload(
+                namespace="build", key=f"build:{root_job_id[:8]}",
+                value={
+                    "html_bytes": len(result.html),
+                    "build_time_s": round(result.build_time, 2),
+                    "output_path": str(html_path),
+                    "has_css": "<style" in result.html,
+                    "has_js": "<script" in result.html,
+                },
+                author_id=NODE_ID, author_role="builder", job_id=root_job_id,
+            ))
+
             print(f"[builder] ✓ Build done ({len(result.html):,} chars) — announced eval task")
 
         except Exception as exc:
@@ -122,4 +137,17 @@ if __name__ == "__main__":
     import sys
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+
+    # Auto-respawn: if killed via KILL_SIGNAL (exit code 42), restart with new identity
+    while True:
+        try:
+            asyncio.run(main())
+            break  # normal exit
+        except SystemExit as e:
+            if e.code == 42:
+                import time as _time
+                NODE_ID = f"builder-{uuid.uuid4().hex[:8]}"  # new identity
+                print(f"[builder] 🔄 Auto-respawn in 3s as {NODE_ID[:12]}…")
+                _time.sleep(3)
+                continue  # restart main()
+            raise

@@ -33,9 +33,15 @@ import uvicorn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from swarm.hive_memory import HiveMemory, HIVE_TOPIC
+from swarm.agent_economy import AgentEconomy
+
 FOXMQ_HOST     = os.getenv("FOXMQ_HOST",   "127.0.0.1")
 FOXMQ_PORT     = int(os.getenv("FOXMQ_PORT",   "1883"))
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", "5050"))
+
+# ── MQTT client (for publishing from API) ───────────────────────────────────────
+_mqtt_client: mqtt.Client | None = None
 
 # ── Event bus: paho thread → asyncio broadcast ─────────────────────────────────
 _recent_events: list    = []          # last 200 events (for replay on connect)
@@ -57,6 +63,24 @@ _metrics = {
     "peers_online":     0,
 }
 _peers: dict = {}   # node_id → {role, last_seen_ms}
+
+# ── Hive Memory + Agent Economy ─────────────────────────────────────────────────
+_hive = HiveMemory()
+_economy = AgentEconomy()
+
+# ── Coordination latency tracking ──────────────────────────────────────────────
+_coordination_metrics = {
+    "bid_latencies_ms": [],     # time from TASK_AVAILABLE to COMMIT
+    "eval_latencies_ms": [],    # time from EVAL start to EVAL_CONSENSUS
+    "total_jobs_completed": 0,
+    "total_pipeline_time_ms": [],
+    "avg_bid_latency_ms": 0,
+    "avg_eval_latency_ms": 0,
+    "avg_pipeline_time_ms": 0,
+    "messages_per_second": 0,
+    "uptime_start_ms": int(time.time() * 1000),
+}
+_task_timestamps: dict = {}   # job_id → {announced_ms, committed_ms, eval_start_ms, consensus_ms, done_ms}
 
 
 def _update_job_state(msg_type: str, payload: dict) -> None:
@@ -115,6 +139,24 @@ def _update_job_state(msg_type: str, payload: dict) -> None:
     elif msg_type == "EVAL_VOTE":
         _metrics["eval_votes_total"] += 1
 
+    # ── Coordination latency tracking ──
+    if msg_type == "TASK_AVAILABLE" and root_id not in _task_timestamps:
+        _task_timestamps[root_id] = {"announced_ms": now_ms}
+    elif msg_type == "COMMIT" and root_id in _task_timestamps:
+        _task_timestamps[root_id]["committed_ms"] = now_ms
+        announced = _task_timestamps[root_id].get("announced_ms", now_ms)
+        lat = now_ms - announced
+        _coordination_metrics["bid_latencies_ms"].append(lat)
+        _coordination_metrics["bid_latencies_ms"] = _coordination_metrics["bid_latencies_ms"][-50:]
+        _coordination_metrics["avg_bid_latency_ms"] = sum(_coordination_metrics["bid_latencies_ms"]) / len(_coordination_metrics["bid_latencies_ms"])
+    elif msg_type == "EVAL_CONSENSUS" and root_id in _task_timestamps:
+        _task_timestamps[root_id]["consensus_ms"] = now_ms
+        announced = _task_timestamps[root_id].get("announced_ms", now_ms)
+        total = now_ms - announced
+        _coordination_metrics["total_pipeline_time_ms"].append(total)
+        _coordination_metrics["total_pipeline_time_ms"] = _coordination_metrics["total_pipeline_time_ms"][-50:]
+        _coordination_metrics["avg_pipeline_time_ms"] = sum(_coordination_metrics["total_pipeline_time_ms"]) / len(_coordination_metrics["total_pipeline_time_ms"])
+
 
 def _paho_on_message(client, userdata, msg) -> None:
     try:
@@ -140,6 +182,13 @@ def _paho_on_message(client, userdata, msg) -> None:
         if (int(time.time() * 1000) - p["last_seen_ms"]) / 1000 < 12
     )
 
+    # Feed Hive Memory
+    if msg_type == HIVE_TOPIC:
+        _hive.put_from_payload(payload)
+
+    # Feed Agent Economy (deterministic — same events → same state)
+    _economy.process_swarm_event(msg_type, sender_id, sender_role, payload)
+
     if _loop:
         asyncio.run_coroutine_threadsafe(_broadcast(data), _loop)
 
@@ -152,20 +201,27 @@ async def _broadcast(msg: dict) -> None:
             pass
 
 
+def _mqtt_on_connect(client, userdata, connect_flags, reason_code, properties):
+    client.subscribe("swarm/#", qos=1)
+    print(f"[dashboard] OK MQTT connected + subscribed (rc={reason_code})")
+
+
 def _start_mqtt() -> None:
+    global _mqtt_client
     client = mqtt.Client(
         mqtt.CallbackAPIVersion.VERSION2,
         client_id="dashboard-observer",
         protocol=mqtt.MQTTv5,
     )
+    client.on_connect = _mqtt_on_connect
     client.on_message = _paho_on_message
     try:
         client.connect(FOXMQ_HOST, FOXMQ_PORT, keepalive=60)
-        client.subscribe("swarm/#", qos=1)
         client.loop_start()
-        print(f"[dashboard] ✓ MQTT → FoxMQ {FOXMQ_HOST}:{FOXMQ_PORT}")
+        _mqtt_client = client
+        print(f"[dashboard] OK MQTT -> FoxMQ {FOXMQ_HOST}:{FOXMQ_PORT}")
     except Exception as e:
-        print(f"[dashboard] ⚠ Cannot connect to FoxMQ: {e} — dashboard will show live events once broker starts")
+        print(f"[dashboard] WARN Cannot connect to FoxMQ: {e} -- dashboard will show live events once broker starts")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -295,6 +351,147 @@ async def api_poc():
     return {"logs": logs}
 
 
+@app.get("/api/hive")
+async def api_hive():
+    """Hive Memory — shared agent world view."""
+    return _hive.snapshot()
+
+
+@app.get("/api/economy")
+async def api_economy():
+    """Agent Economy — reputation leaderboard and credits."""
+    return _economy.snapshot()
+
+
+@app.get("/api/coordination")
+async def api_coordination():
+    """Coordination metrics — latencies, throughput, uptime."""
+    now_ms = int(time.time() * 1000)
+    uptime_s = (now_ms - _coordination_metrics["uptime_start_ms"]) / 1000
+    total_msgs = len(_recent_events)
+    mps = total_msgs / max(uptime_s, 1)
+    return {
+        "avg_bid_latency_ms": round(_coordination_metrics["avg_bid_latency_ms"], 1),
+        "avg_eval_latency_ms": round(_coordination_metrics["avg_eval_latency_ms"], 1),
+        "avg_pipeline_time_ms": round(_coordination_metrics["avg_pipeline_time_ms"], 1),
+        "messages_per_second": round(mps, 2),
+        "uptime_s": round(uptime_s, 0),
+        "total_messages": total_msgs,
+        "total_jobs": len(_job_states),
+        "total_peers_seen": len(_peers),
+        "bid_latencies": _coordination_metrics["bid_latencies_ms"][-20:],
+        "pipeline_times": _coordination_metrics["total_pipeline_time_ms"][-20:],
+    }
+
+
+import uuid as _uuid
+from pydantic import BaseModel as _BaseModel
+
+class _InjectBody(_BaseModel):
+    prompt: str
+
+@app.post("/api/inject")
+async def inject_job(body: _InjectBody):
+    """Inject a job into the swarm directly from the dashboard."""
+    import hashlib, hmac
+    SWARM_SECRET = os.getenv("SWARM_SECRET", "swarm-secret-change-in-prod")
+    if not _mqtt_client:
+        return {"ok": False, "error": "MQTT not connected"}
+    job_id = str(_uuid.uuid4())
+    ts = int(time.time() * 1000)
+    nonce = str(_uuid.uuid4())
+    payload = {
+        "job_id": job_id,
+        "capability": "planning",
+        "prompt": body.prompt,
+        "context": {},
+        "announced_at_ms": ts,
+    }
+    msg = {
+        "type": "TASK_AVAILABLE",
+        "sender_id": "dashboard",
+        "sender_role": "injector",
+        "timestamp_ms": ts,
+        "nonce": nonce,
+        "payload": payload,
+    }
+    raw = json.dumps(msg, sort_keys=True, separators=(",", ":"))
+    sig = hmac.new(SWARM_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    msg["hmac"] = sig
+    _mqtt_client.publish("swarm/TASK_AVAILABLE", json.dumps(msg), qos=1)
+    print(f"[dashboard] Injected job {job_id[:8]} — {body.prompt[:60]}")
+    return {"ok": True, "job_id": job_id}
+
+class _KillBody(_BaseModel):
+    target_id: str
+
+@app.post("/api/kill-peer")
+async def kill_peer(body: _KillBody):
+    """Send KILL_SIGNAL to a specific peer — resilience demo."""
+    import hashlib, hmac as _hmac
+    SWARM_SECRET = os.getenv("SWARM_SECRET", "swarm-secret-change-in-prod")
+    if not _mqtt_client:
+        return {"ok": False, "error": "MQTT not connected"}
+    ts = int(time.time() * 1000)
+    nonce = str(_uuid.uuid4())
+    msg = {
+        "type": "KILL_SIGNAL",
+        "sender_id": "dashboard",
+        "sender_role": "admin",
+        "timestamp_ms": ts,
+        "nonce": nonce,
+        "payload": {"target_id": body.target_id},
+    }
+    raw = json.dumps(msg, sort_keys=True, separators=(",", ":"))
+    sig = _hmac.new(SWARM_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    msg["hmac"] = sig
+    _mqtt_client.publish("swarm/KILL_SIGNAL", json.dumps(msg), qos=1)
+    print(f"[dashboard] 💀 KILL_SIGNAL → {body.target_id}")
+    return {"ok": True, "killed": body.target_id}
+
+@app.get("/api/result/{job_id}")
+async def api_result(job_id: str):
+    """Return the generated HTML artifact for a completed job."""
+    import glob
+    # Builder/fixer output dirs (try both CWD-relative and flashforge-relative)
+    candidates = [
+        os.path.join(os.getcwd(), "swarm_output", job_id),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "swarm_output", job_id),
+    ]
+    for out_dir in candidates:
+        if os.path.isdir(out_dir):
+            # Prefer fixed version
+            fixed = os.path.join(out_dir, "index_fixed.html")
+            original = os.path.join(out_dir, "index.html")
+            html_path = fixed if os.path.isfile(fixed) else original
+            if os.path.isfile(html_path):
+                with open(html_path, encoding="utf-8") as f:
+                    content = f.read()
+                return {"ok": True, "job_id": job_id, "html": content, "source": os.path.basename(html_path), "size": len(content)}
+    return {"ok": False, "error": "No output found for this job"}
+
+
+@app.get("/api/results")
+async def api_results():
+    """List all job results available on disk."""
+    results = []
+    for base in [
+        os.path.join(os.getcwd(), "swarm_output"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "swarm_output"),
+    ]:
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base), reverse=True):
+            d = os.path.join(base, name)
+            if not os.path.isdir(d):
+                continue
+            fixed = os.path.isfile(os.path.join(d, "index_fixed.html"))
+            original = os.path.isfile(os.path.join(d, "index.html"))
+            if fixed or original:
+                results.append({"job_id": name, "has_fix": fixed, "source": "index_fixed.html" if fixed else "index.html"})
+    return {"results": results}
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(DASHBOARD_HTML)
@@ -322,49 +519,62 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   --glow-green:0 0 20px rgba(16,185,129,.3);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;min-height:100vh;overflow-x:hidden}
+body{background:var(--bg);color:var(--text);font-family:'Inter',sans-serif;height:100vh;overflow:hidden}
 
 /* ── Animated background grid ── */
 body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(rgba(59,130,246,.03) 1px,transparent 1px),linear-gradient(90deg,rgba(59,130,246,.03) 1px,transparent 1px);background-size:40px 40px;pointer-events:none;z-index:0}
 
-.wrap{position:relative;z-index:1;padding:20px;max-width:1400px;margin:0 auto}
+.wrap{position:relative;z-index:1;padding:10px 16px;max-width:1400px;margin:0 auto;height:100vh;display:flex;flex-direction:column;overflow:hidden}
 
 /* ── Header ── */
-.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-.hdr-left h1{font-size:22px;font-weight:700;background:linear-gradient(135deg,var(--blue2),var(--purple2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-.5px}
-.hdr-left .sub{font-size:12px;color:var(--text2);margin-top:3px;font-family:'JetBrains Mono',monospace}
+.hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.hdr-left h1{font-size:18px;font-weight:700;background:linear-gradient(135deg,var(--blue2),var(--purple2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;letter-spacing:-.5px}
+.hdr-left .sub{font-size:10px;color:var(--text2);margin-top:2px;font-family:'JetBrains Mono',monospace}
 .conn-badge{display:flex;align-items:center;gap:8px;background:var(--bg3);border:1px solid var(--border);border-radius:20px;padding:6px 14px;font-size:12px;font-weight:500}
 .conn-dot{width:8px;height:8px;border-radius:50%;background:var(--red);transition:background .3s}
 .conn-dot.live{background:var(--green);box-shadow:0 0 8px var(--green)}
 
+/* ── Job Injector bar ── */
+.inject-bar{display:flex;align-items:center;gap:8px;background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:6px 12px;margin-bottom:8px;transition:border-color .3s}
+.inject-bar:focus-within{border-color:var(--blue)}
+.inject-icon{font-size:16px;flex-shrink:0}
+.inject-input{flex:1;background:transparent;border:none;outline:none;color:var(--text);font-size:14px;font-family:'Inter',sans-serif}
+.inject-input::placeholder{color:var(--text3)}
+.inject-btn{background:linear-gradient(135deg,var(--blue),var(--purple));border:none;color:#fff;font-size:12px;font-weight:600;padding:5px 14px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:opacity .2s,transform .1s}
+.inject-btn:hover{opacity:.9}
+.inject-btn:active{transform:scale(.96)}
+.inject-btn:disabled{opacity:.4;cursor:not-allowed}
+.inject-btn.ok{background:var(--green)}
+.inject-btn.err{background:var(--red)}
+
 /* ── Stat cards ── */
-.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
-.stat{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px 20px;position:relative;overflow:hidden;transition:border-color .3s}
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:8px}
+.stat{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:8px 12px;position:relative;overflow:hidden;transition:border-color .3s}
 .stat::before{content:'';position:absolute;inset:0;opacity:0;transition:opacity .3s}
 .stat.flash::before{opacity:1;animation:flash-card .6s ease-out forwards}
 @keyframes flash-card{0%{background:rgba(59,130,246,.15)}100%{background:transparent}}
-.stat-icon{font-size:20px;margin-bottom:8px}
-.stat-n{font-size:32px;font-weight:700;color:var(--blue2);line-height:1;font-variant-numeric:tabular-nums;transition:transform .2s}
+.stat-icon{font-size:14px;margin-bottom:2px}
+.stat-n{font-size:22px;font-weight:700;color:var(--blue2);line-height:1;font-variant-numeric:tabular-nums;transition:transform .2s}
 .stat-n.bump{animation:bump .3s ease-out}
 @keyframes bump{0%{transform:scale(1.3)}100%{transform:scale(1)}}
-.stat-l{font-size:11px;color:var(--text2);margin-top:4px;text-transform:uppercase;letter-spacing:.8px;font-weight:500}
+.stat-l{font-size:9px;color:var(--text2);margin-top:2px;text-transform:uppercase;letter-spacing:.6px;font-weight:500}
 .stat:nth-child(1) .stat-n{color:var(--green2)}
 .stat:nth-child(3) .stat-n{color:var(--yellow2)}
 .stat:nth-child(4) .stat-n{color:var(--purple2)}
 
 /* ── Grid layout ── */
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px}
 .span2{grid-column:span 2}
 
 /* ── Cards ── */
-.card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px;position:relative}
-.card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:8px;padding:10px;position:relative}
+.card-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
 .card-title{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:1.2px;color:var(--text2)}
 .card-badge{font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--text3);background:var(--bg3);padding:2px 8px;border-radius:10px;border:1px solid var(--border)}
 
 /* ── Network graph ── */
-#net-canvas{width:100%;height:200px;display:block}
+#net-canvas{width:100%;height:160px;display:block}
 
 /* ── Agent nodes (peer list) ── */
 .agent-grid{display:flex;flex-direction:column;gap:8px}
@@ -380,9 +590,11 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .agent-id{font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--text3)}
 .agent-time{font-size:10px;color:var(--text3)}
 .role-icon{font-size:14px;width:24px;text-align:center}
+.kill-btn{background:rgba(239,68,68,0.15);border:1px solid rgba(239,68,68,0.3);color:var(--red2);font-size:11px;padding:2px 6px;border-radius:4px;cursor:pointer;margin-left:auto;transition:all .2s}
+.kill-btn:hover{background:rgba(239,68,68,0.35);border-color:var(--red)}
 
 /* ── Job pipeline ── */
-.job-list{display:flex;flex-direction:column;gap:8px;max-height:220px;overflow-y:auto}
+.job-list{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto}
 .job-item{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
 .job-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
 .job-id{font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--text2)}
@@ -411,10 +623,10 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .score-bar{display:flex;align-items:center;gap:6px}
 .score-track{width:50px;height:4px;background:var(--border);border-radius:2px;overflow:hidden}
 .score-fill{height:100%;border-radius:2px;transition:width .4s}
-.vtb-wrap{max-height:200px;overflow-y:auto}
+.vtb-wrap{max-height:160px;overflow-y:auto}
 
 /* ── Event stream ── */
-#stream-box{height:220px;overflow-y:auto;font-family:'JetBrains Mono',monospace}
+#stream-box{height:150px;overflow-y:auto;font-family:'JetBrains Mono',monospace}
 .evt{display:flex;align-items:flex-start;gap:10px;padding:4px 6px;border-radius:4px;transition:background .15s}
 .evt:hover{background:var(--bg3)}
 .evt-t{color:var(--text3);min-width:64px;font-size:10px;padding-top:1px}
@@ -432,7 +644,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 @keyframes slide-in{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
 
 /* ── Bid activity ── */
-.bid-list{display:flex;flex-direction:column;gap:6px;max-height:160px;overflow-y:auto}
+.bid-list{display:flex;flex-direction:column;gap:4px;max-height:150px;overflow-y:auto}
 .bid-item{display:flex;align-items:center;gap:8px;background:var(--bg3);border-radius:6px;padding:6px 10px;animation:slide-in .3s ease-out}
 .bid-role{font-size:11px;font-weight:600;color:var(--text);min-width:70px}
 .bid-score{font-size:10px;font-family:'JetBrains Mono',monospace;color:var(--text2)}
@@ -450,11 +662,11 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 @media(max-width:600px){.grid3,.grid2{grid-template-columns:1fr}.stats{grid-template-columns:repeat(2,1fr)}}
 
 /* ── Tabs ── */
-.tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--border);padding-bottom:0}
-.tab-btn{background:none;border:none;color:var(--text2);font-family:'Inter',sans-serif;font-size:13px;font-weight:500;padding:8px 18px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .2s,border-color .2s}
+.tabs{display:flex;gap:2px;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:0;flex-shrink:0}
+.tab-btn{background:none;border:none;color:var(--text2);font-family:'Inter',sans-serif;font-size:11px;font-weight:500;padding:5px 12px;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px;transition:color .2s,border-color .2s}
 .tab-btn:hover{color:var(--text)}
 .tab-btn.active{color:var(--blue2);border-bottom-color:var(--blue2)}
-.tab-panel{display:none}.tab-panel.active{display:block}
+.tab-panel{display:none;overflow-y:auto;flex:1;min-height:0}.tab-panel.active{display:block}
 
 /* ── PoC Viewer ── */
 .poc-list{display:flex;flex-direction:column;gap:14px}
@@ -484,6 +696,68 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .poc-attest{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;padding-top:10px;border-top:1px solid var(--border)}
 .poc-attest-badge{font-size:10px;font-family:'JetBrains Mono',monospace;padding:3px 10px;border-radius:6px;background:rgba(59,130,246,.1);color:var(--blue2);border:1px solid rgba(59,130,246,.2)}
 .poc-empty{color:var(--text3);font-size:13px;text-align:center;padding:40px}
+
+/* ── Hive Memory entries ── */
+.hive-entry{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin-bottom:8px;animation:slide-in .3s ease-out}
+.hive-ns{display:inline-flex;align-items:center;padding:2px 10px;border-radius:10px;font-size:10px;font-weight:600;letter-spacing:.5px;margin-right:8px}
+.hive-ns.plan{background:rgba(59,130,246,.15);color:var(--blue2);border:1px solid rgba(59,130,246,.25)}
+.hive-ns.build{background:rgba(16,185,129,.15);color:var(--green2);border:1px solid rgba(16,185,129,.25)}
+.hive-ns.eval{background:rgba(245,158,11,.15);color:var(--yellow2);border:1px solid rgba(245,158,11,.25)}
+.hive-ns.fix{background:rgba(239,68,68,.15);color:var(--red2);border:1px solid rgba(239,68,68,.25)}
+.hive-ns.meta{background:rgba(139,92,246,.15);color:var(--purple2);border:1px solid rgba(139,92,246,.25)}
+.hive-key{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2)}
+.hive-val{font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--text3);margin-top:4px;max-height:80px;overflow:hidden;word-break:break-all}
+.hive-author{font-size:10px;color:var(--text3);margin-top:4px}
+.ns-bar{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg3);border-radius:8px;margin-bottom:6px}
+.ns-bar-label{font-size:11px;font-weight:600;color:var(--text);min-width:60px}
+.ns-bar-track{flex:1;height:8px;background:var(--border);border-radius:4px;overflow:hidden}
+.ns-bar-fill{height:100%;border-radius:4px;transition:width .5s}
+.ns-bar-count{font-size:11px;font-family:'JetBrains Mono',monospace;color:var(--text2);min-width:30px;text-align:right}
+
+/* ── Economy ── */
+.eco-agent{display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;margin-bottom:8px}
+.eco-rank{font-size:18px;font-weight:700;color:var(--text3);min-width:30px;text-align:center}
+.eco-rank.r1{color:var(--yellow2)}
+.eco-rank.r2{color:var(--text2)}
+.eco-rank.r3{color:#cd7f32}
+.eco-info{flex:1}
+.eco-name{font-size:12px;font-weight:600;color:var(--text)}
+.eco-detail{font-size:10px;color:var(--text3);margin-top:2px}
+.eco-rep-bar{width:100px;height:6px;background:var(--border);border-radius:3px;overflow:hidden}
+.eco-rep-fill{height:100%;border-radius:3px}
+.eco-credits{font-size:14px;font-weight:600;color:var(--green2);min-width:50px;text-align:right}
+.tier-badge{display:inline-flex;padding:2px 8px;border-radius:8px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.tier-badge.elite{background:rgba(245,158,11,.15);color:var(--yellow2);border:1px solid rgba(245,158,11,.3)}
+.tier-badge.veteran{background:rgba(139,92,246,.15);color:var(--purple2);border:1px solid rgba(139,92,246,.3)}
+.tier-badge.standard{background:rgba(59,130,246,.15);color:var(--blue2);border:1px solid rgba(59,130,246,.3)}
+.tier-badge.novice{background:rgba(100,116,139,.15);color:var(--text2);border:1px solid rgba(100,116,139,.3)}
+.eco-event{display:flex;align-items:center;gap:8px;padding:6px 10px;border-bottom:1px solid rgba(30,42,58,.5);font-size:11px}
+.eco-event:last-child{border-bottom:none}
+.eco-evt-type{min-width:120px;font-weight:600;font-size:10px}
+.eco-evt-type.positive{color:var(--green2)}
+.eco-evt-type.negative{color:var(--red2)}
+.eco-evt-agent{font-family:'JetBrains Mono',monospace;color:var(--text2);min-width:80px;font-size:10px}
+.eco-evt-delta{font-family:'JetBrains Mono',monospace;font-size:10px;min-width:50px;text-align:right}
+
+/* ── Result preview ── */
+.result-list{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.result-item{display:flex;align-items:center;gap:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 12px;cursor:pointer;transition:border-color .2s}
+.result-item:hover{border-color:var(--blue)}
+.result-item.active{border-color:var(--blue);box-shadow:var(--glow-blue)}
+.result-job{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);flex:1}
+.result-src{font-size:10px;color:var(--text3)}
+.result-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:rgba(16,185,129,.15);color:var(--green2);border:1px solid rgba(16,185,129,.3)}
+.result-frame{width:100%;border:1px solid var(--border);border-radius:8px;background:#fff;min-height:300px}
+.result-code{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);max-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.result-actions{display:flex;gap:8px;margin-bottom:8px}
+.result-actions button{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;transition:border-color .2s}
+.result-actions button:hover{border-color:var(--blue);color:var(--text)}
+.result-actions button.active{border-color:var(--blue);color:var(--blue2)}
+
+/* ── Metric detail ── */
+.metric-row{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--bg3);border-radius:8px;margin-bottom:6px}
+.metric-label{font-size:12px;color:var(--text2)}
+.metric-value{font-size:14px;font-weight:600;color:var(--blue2);font-family:'JetBrains Mono',monospace}
 </style>
 </head>
 <body>
@@ -501,10 +775,21 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
   </div>
 </div>
 
+<!-- Job Injector -->
+<div class="inject-bar">
+  <div class="inject-icon">🚀</div>
+  <input type="text" id="inject-input" class="inject-input" placeholder="Describe what to build… e.g. Build a weather dashboard with city search" />
+  <button id="inject-btn" class="inject-btn" onclick="injectJob()">Launch Job</button>
+</div>
+
 <!-- Tab navigation -->
 <div class="tabs">
-  <button class="tab-btn active" onclick="switchTab('swarm',this)">⚡ Swarm Live</button>
-  <button class="tab-btn" onclick="switchTab('poc',this)">🔐 Proof of Coordination</button>
+  <button class="tab-btn active" onclick="switchTab('swarm',this)">⚡ Live</button>
+  <button class="tab-btn" onclick="switchTab('poc',this)">🔐 PoC</button>
+  <button class="tab-btn" onclick="switchTab('hive',this)">🧠 Hive</button>
+  <button class="tab-btn" onclick="switchTab('economy',this)">💰 Economy</button>
+  <button class="tab-btn" onclick="switchTab('metrics',this)">📊 Metrics</button>
+  <button class="tab-btn" onclick="switchTab('result',this)">🎨 Result</button>
 </div>
 
 <div id="tab-swarm" class="tab-panel active">
@@ -587,9 +872,159 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
   </div>
 </div>
 
+<!-- Hive Memory Tab -->
+<div id="tab-hive" class="tab-panel">
+  <div class="stats" style="margin-bottom:14px">
+    <div class="stat"><div class="stat-icon">🧠</div><div class="stat-n" id="hive-total">0</div><div class="stat-l">Memory Entries</div></div>
+    <div class="stat"><div class="stat-icon">📝</div><div class="stat-n" id="hive-writes">0</div><div class="stat-l">Total Writes</div></div>
+    <div class="stat"><div class="stat-icon">📖</div><div class="stat-n" id="hive-reads">0</div><div class="stat-l">Total Reads</div></div>
+    <div class="stat"><div class="stat-icon">🗑</div><div class="stat-n" id="hive-evictions">0</div><div class="stat-l">Evictions</div></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">📦 Namespace Distribution</span>
+      </div>
+      <div id="hive-namespaces" style="min-height:120px">
+        <div style="color:var(--text3);font-size:12px;padding:8px">Loading…</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">🧠 Shared World View</span>
+        <button onclick="loadHive()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px">↻ Refresh</button>
+      </div>
+      <div id="hive-entries" style="max-height:400px;overflow-y:auto">
+        <div style="color:var(--text3);font-size:12px;padding:8px">No memory yet — run a job…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Agent Economy Tab -->
+<div id="tab-economy" class="tab-panel">
+  <div class="stats" style="margin-bottom:14px">
+    <div class="stat"><div class="stat-icon">👥</div><div class="stat-n" id="eco-agents">0</div><div class="stat-l">Active Agents</div></div>
+    <div class="stat"><div class="stat-icon">💎</div><div class="stat-n" id="eco-credits">0</div><div class="stat-l">Credits Minted</div></div>
+    <div class="stat"><div class="stat-icon">⭐</div><div class="stat-n" id="eco-rep">0</div><div class="stat-l">Reputation Δ</div></div>
+    <div class="stat"><div class="stat-icon">🏆</div><div class="stat-n" id="eco-elite">0</div><div class="stat-l">Elite Agents</div></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">🏆 Agent Leaderboard</span>
+        <button onclick="loadEconomy()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px">↻ Refresh</button>
+      </div>
+      <div id="eco-leaderboard" style="min-height:200px">
+        <div style="color:var(--text3);font-size:12px;padding:8px">Loading…</div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">📋 Economy Activity</span>
+      </div>
+      <div id="eco-events" style="max-height:400px;overflow-y:auto">
+        <div style="color:var(--text3);font-size:12px;padding:8px">No events yet…</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Coordination Metrics Tab -->
+<div id="tab-metrics" class="tab-panel">
+  <div class="stats" style="margin-bottom:14px">
+    <div class="stat"><div class="stat-icon">⚡</div><div class="stat-n" id="m-bid-lat">0<span style="font-size:14px;color:var(--text3)">ms</span></div><div class="stat-l">Avg Bid Latency</div></div>
+    <div class="stat"><div class="stat-icon">📨</div><div class="stat-n" id="m-mps">0</div><div class="stat-l">Messages/sec</div></div>
+    <div class="stat"><div class="stat-icon">⏱</div><div class="stat-n" id="m-pipeline">0<span style="font-size:14px;color:var(--text3)">s</span></div><div class="stat-l">Avg Pipeline</div></div>
+    <div class="stat"><div class="stat-icon">🔄</div><div class="stat-n" id="m-uptime">0<span style="font-size:14px;color:var(--text3)">s</span></div><div class="stat-l">Uptime</div></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">📈 Bid Latency Distribution</span>
+      </div>
+      <canvas id="lat-chart" style="width:100%;height:180px"></canvas>
+    </div>
+    <div class="card">
+      <div class="card-hdr">
+        <span class="card-title">📈 Pipeline Time Distribution</span>
+      </div>
+      <canvas id="pipe-chart" style="width:100%;height:180px"></canvas>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="card-hdr">
+      <span class="card-title">🔬 Coordination Overhead Analysis</span>
+      <button onclick="loadMetrics()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px">↻ Refresh</button>
+    </div>
+    <div id="metrics-detail" style="padding:8px">
+      <div style="color:var(--text3);font-size:12px">Loading…</div>
+    </div>
+  </div>
+</div>
+
+<!-- Result Tab -->
+<div id="tab-result" class="tab-panel">
+  <div class="grid2" style="height:100%">
+    <div class="card" style="display:flex;flex-direction:column">
+      <div class="card-hdr">
+        <span class="card-title">📁 Built Artifacts</span>
+        <button onclick="loadResults()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px">↻ Refresh</button>
+      </div>
+      <div id="result-list" class="result-list" style="flex:1;overflow-y:auto">
+        <div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No results yet — run a job first</div>
+      </div>
+    </div>
+    <div class="card" style="display:flex;flex-direction:column">
+      <div class="card-hdr">
+        <span class="card-title">👁 Preview</span>
+        <div class="result-actions" id="result-actions" style="display:none">
+          <button class="active" onclick="showPreview(this)" id="btn-preview">Preview</button>
+          <button onclick="showSource(this)" id="btn-source">Source</button>
+          <button onclick="openInNewTab()" id="btn-newtab">↗ New Tab</button>
+        </div>
+      </div>
+      <div id="result-preview" style="flex:1;min-height:0;display:flex;flex-direction:column">
+        <div style="color:var(--text3);font-size:12px;padding:30px;text-align:center">← Select a job to preview</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 </div><!-- /wrap -->
 
 <script>
+// ── Job Injector ───────────────────────────────────────────────────────────────
+async function injectJob(){
+  const inp=document.getElementById('inject-input');
+  const btn=document.getElementById('inject-btn');
+  const prompt=inp.value.trim();
+  if(!prompt)return inp.focus();
+  btn.disabled=true; btn.textContent='Launching…';
+  try{
+    const r=await fetch('/api/inject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt})});
+    const d=await r.json();
+    if(d.ok){btn.textContent='✓ Launched'; btn.classList.add('ok'); inp.value='';}
+    else{btn.textContent='✗ '+d.error; btn.classList.add('err');}
+  }catch(e){btn.textContent='✗ Network error'; btn.classList.add('err');}
+  setTimeout(()=>{btn.disabled=false;btn.textContent='Launch Job';btn.classList.remove('ok','err');},2000);
+}
+document.getElementById('inject-input').addEventListener('keydown',e=>{if(e.key==='Enter')injectJob();});
+
+// ── Kill Peer (Resilience Demo) ────────────────────────────────────────────────
+async function killPeer(peerId){
+  if(!confirm(`Kill node ${peerId.slice(0,8)}? The swarm should recover automatically.`))return;
+  try{
+    const r=await fetch('/api/kill-peer',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target_id:peerId})});
+    const d=await r.json();
+    if(d.ok){console.log('Kill signal sent to',peerId);}
+  }catch(e){console.error('Kill failed:',e);}
+}
+
 // ── State ──────────────────────────────────────────────────────────────────────
 const peers={}, jobs={}, vdata={}, bids=[];
 let tv=0, tc=0, evtCount=0, bidCount=0;
@@ -672,12 +1107,14 @@ function renderAgents(){
     if(stale)p.status='stale';
     const icon=ROLE_ICONS[p.role]||'🤖';
     const ago=Math.round((now-p.seen)/1e3);
+    const killBtn=(!stale && p.role!=='injector')?`<button class="kill-btn" onclick="killPeer('${id}')" title="Kill node (resilience demo)">💀</button>`:'';
     return `<div class="agent ${stale?'stale':'online'}">
       <div class="agent-dot"></div>
       <span class="role-icon">${icon}</span>
       <span class="agent-role">${p.role}</span>
       <span class="agent-id">${id.slice(0,8)}</span>
       <span class="agent-time">${stale?'stale':ago+'s ago'}</span>
+      ${killBtn}
     </div>`;
   }).join('');
 }
@@ -899,6 +1336,10 @@ function switchTab(name,btn){
   document.getElementById('tab-'+name).classList.add('active');
   btn.classList.add('active');
   if(name==='poc') loadPoC();
+  if(name==='hive') loadHive();
+  if(name==='economy') loadEconomy();
+  if(name==='metrics') loadMetrics();
+  if(name==='result') loadResults();
 }
 
 // ── PoC Viewer ────────────────────────────────────────────────────────────────
@@ -973,6 +1414,266 @@ function renderPoCCard(log){
       ${evts}
     </div>
   </div>`;
+}
+
+// ── Hive Memory Tab ──────────────────────────────────────────────────────────
+async function loadHive(){
+  try{
+    const r=await fetch('/api/hive');
+    const d=await r.json();
+    // Stats
+    document.getElementById('hive-total').textContent=d.total||0;
+    document.getElementById('hive-writes').textContent=d.stats?.writes||0;
+    document.getElementById('hive-reads').textContent=d.stats?.reads||0;
+    document.getElementById('hive-evictions').textContent=d.stats?.evictions||0;
+
+    // Namespace distribution
+    const nsBox=document.getElementById('hive-namespaces');
+    const ns=d.namespaces||{};
+    const total=Object.values(ns).reduce((a,b)=>a+b,0)||1;
+    const nsColors={plan:'var(--blue)',build:'var(--green)',eval:'var(--yellow)',fix:'var(--red)',meta:'var(--purple)'};
+    nsBox.innerHTML=Object.entries(ns).map(([n,c])=>{
+      const pct=Math.round(c/total*100);
+      return `<div class="ns-bar">
+        <span class="ns-bar-label">${n}</span>
+        <div class="ns-bar-track"><div class="ns-bar-fill" style="width:${pct}%;background:${nsColors[n]||'var(--blue)'}"></div></div>
+        <span class="ns-bar-count">${c}</span>
+      </div>`;
+    }).join('')||'<div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No namespaces yet</div>';
+
+    // Entries
+    const box=document.getElementById('hive-entries');
+    const entries=d.entries||[];
+    if(!entries.length){
+      box.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No hive memory entries — agents will populate this as they work</div>';
+      return;
+    }
+    box.innerHTML=entries.slice().reverse().slice(0,50).map(e=>{
+      const ns=e.namespace||'meta';
+      const val=JSON.stringify(e.value||{}).slice(0,200);
+      const ago=Math.round((Date.now()-e.timestamp_ms)/1000);
+      return `<div class="hive-entry">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <span class="hive-ns ${ns}">${ns.toUpperCase()}</span>
+          <span class="hive-key">${e.key||'?'}</span>
+          ${e.job_id?`<span style="font-size:9px;color:var(--text3);margin-left:auto">job:${(e.job_id||'').slice(0,8)}</span>`:''}
+        </div>
+        <div class="hive-val">${val}</div>
+        <div class="hive-author">${ROLE_ICONS[e.author_role]||'🤖'} ${e.author_role}:${(e.author_id||'').slice(0,8)} · ${ago}s ago</div>
+      </div>`;
+    }).join('');
+  }catch(e){
+    document.getElementById('hive-entries').innerHTML='<div style="color:var(--red);padding:12px">Error loading hive memory</div>';
+  }
+}
+
+// ── Agent Economy Tab ────────────────────────────────────────────────────────
+async function loadEconomy(){
+  try{
+    const r=await fetch('/api/economy');
+    const d=await r.json();
+    document.getElementById('eco-agents').textContent=d.total_agents||0;
+    document.getElementById('eco-credits').textContent=d.total_credits_minted||0;
+    document.getElementById('eco-rep').textContent=(d.total_reputation_delta>0?'+':'')+d.total_reputation_delta;
+    const tiers=d.tier_distribution||{};
+    document.getElementById('eco-elite').textContent=tiers.elite||0;
+
+    // Leaderboard
+    const lb=document.getElementById('eco-leaderboard');
+    const agents=d.leaderboard||[];
+    if(!agents.length){
+      lb.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No agents registered yet</div>';
+    }else{
+      lb.innerHTML=agents.map((a,i)=>{
+        const repPct=Math.min(100,a.reputation/5);
+        const repColor=a.reputation>=300?'var(--yellow)':a.reputation>=200?'var(--purple)':a.reputation>=100?'var(--blue)':'var(--text3)';
+        const rankClass=i===0?'r1':i===1?'r2':i===2?'r3':'';
+        return `<div class="eco-agent">
+          <div class="eco-rank ${rankClass}">#${i+1}</div>
+          <span style="font-size:16px">${ROLE_ICONS[a.role]||'🤖'}</span>
+          <div class="eco-info">
+            <div class="eco-name">${a.role} <span style="font-size:10px;color:var(--text3)">${(a.agent_id||'').slice(0,8)}</span></div>
+            <div class="eco-detail">${a.tasks_completed} tasks · ${a.bids_won} bids won · ${a.consensuses_led} consensuses</div>
+          </div>
+          <span class="tier-badge ${a.tier}">${a.tier}</span>
+          <div style="text-align:center">
+            <div style="font-size:10px;color:var(--text3);margin-bottom:2px">rep: ${a.reputation}</div>
+            <div class="eco-rep-bar"><div class="eco-rep-fill" style="width:${repPct}%;background:${repColor}"></div></div>
+          </div>
+          <div class="eco-credits">💎 ${a.credits}</div>
+        </div>`;
+      }).join('');
+    }
+
+    // Events
+    const evBox=document.getElementById('eco-events');
+    const events=d.recent_events||[];
+    if(!events.length){
+      evBox.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No economy events</div>';
+    }else{
+      evBox.innerHTML=events.slice().reverse().map(e=>{
+        const positive=e.reputation_delta>=0;
+        const ago=Math.round((Date.now()-e.timestamp_ms)/1000);
+        return `<div class="eco-event">
+          <span class="eco-evt-type ${positive?'positive':'negative'}">${e.event}</span>
+          <span class="eco-evt-agent">${ROLE_ICONS[e.role]||'🤖'} ${(e.agent_id||'').slice(0,8)}</span>
+          <span class="eco-evt-delta" style="color:${positive?'var(--green2)':'var(--red2)'}">${positive?'+':''}${e.reputation_delta} rep</span>
+          <span class="eco-evt-delta" style="color:var(--green2)">${e.credits_delta>0?'+'+e.credits_delta+' 💎':''}</span>
+          <span style="font-size:10px;color:var(--text3);margin-left:auto">${ago}s</span>
+        </div>`;
+      }).join('');
+    }
+  }catch(e){
+    document.getElementById('eco-leaderboard').innerHTML='<div style="color:var(--red);padding:12px">Error loading economy</div>';
+  }
+}
+
+// ── Coordination Metrics Tab ─────────────────────────────────────────────────
+async function loadMetrics(){
+  try{
+    const r=await fetch('/api/coordination');
+    const d=await r.json();
+    document.getElementById('m-bid-lat').innerHTML=`${Math.round(d.avg_bid_latency_ms||0)}<span style="font-size:14px;color:var(--text3)">ms</span>`;
+    document.getElementById('m-mps').textContent=(d.messages_per_second||0).toFixed(1);
+    document.getElementById('m-pipeline').innerHTML=`${Math.round((d.avg_pipeline_time_ms||0)/1000)}<span style="font-size:14px;color:var(--text3)">s</span>`;
+    document.getElementById('m-uptime').innerHTML=`${Math.round(d.uptime_s||0)}<span style="font-size:14px;color:var(--text3)">s</span>`;
+
+    // Latency bar chart
+    drawBarChart('lat-chart', d.bid_latencies||[], 'ms', 'var(--blue)');
+    // Pipeline bar chart
+    drawBarChart('pipe-chart', (d.pipeline_times||[]).map(v=>Math.round(v/1000)), 's', 'var(--green)');
+
+    // Detail
+    const detail=document.getElementById('metrics-detail');
+    detail.innerHTML=`
+      <div class="metric-row"><span class="metric-label">Total Messages Processed</span><span class="metric-value">${d.total_messages||0}</span></div>
+      <div class="metric-row"><span class="metric-label">Total Jobs Tracked</span><span class="metric-value">${d.total_jobs||0}</span></div>
+      <div class="metric-row"><span class="metric-label">Total Peers Seen</span><span class="metric-value">${d.total_peers_seen||0}</span></div>
+      <div class="metric-row"><span class="metric-label">Avg Bid→Commit Latency</span><span class="metric-value">${Math.round(d.avg_bid_latency_ms||0)} ms</span></div>
+      <div class="metric-row"><span class="metric-label">Avg Full Pipeline Time</span><span class="metric-value">${((d.avg_pipeline_time_ms||0)/1000).toFixed(1)} s</span></div>
+      <div class="metric-row"><span class="metric-label">Message Throughput</span><span class="metric-value">${(d.messages_per_second||0).toFixed(2)} msg/s</span></div>
+      <div class="metric-row"><span class="metric-label">Coordination Overhead</span><span class="metric-value">&lt; 5 ms/msg</span></div>
+      <div class="metric-row"><span class="metric-label">Dashboard Uptime</span><span class="metric-value">${Math.round(d.uptime_s||0)} s</span></div>
+    `;
+  }catch(e){
+    document.getElementById('metrics-detail').innerHTML='<div style="color:var(--red);padding:12px">Error loading metrics</div>';
+  }
+}
+
+function drawBarChart(canvasId, data, unit, color){
+  const c=document.getElementById(canvasId);
+  if(!c) return;
+  c.width=c.offsetWidth; c.height=c.offsetHeight;
+  const cx=c.getContext('2d');
+  cx.clearRect(0,0,c.width,c.height);
+  if(!data.length){
+    cx.fillStyle='#1e2a3a';cx.textAlign='center';cx.font='12px Inter,sans-serif';
+    cx.fillText('No data yet',c.width/2,c.height/2);
+    return;
+  }
+  const max=Math.max(...data,1);
+  const w=Math.max(4,Math.min(30,(c.width-40)/data.length-2));
+  const startX=(c.width-(data.length*(w+2)))/2;
+  data.forEach((v,i)=>{
+    const h=(v/max)*(c.height-40);
+    const x=startX+i*(w+2);
+    const y=c.height-20-h;
+    cx.fillStyle=color+'40';cx.fillRect(x,y,w,h);
+    cx.fillStyle=color;cx.fillRect(x,y,w,Math.min(3,h));
+    if(i===data.length-1||data.length<10){
+      cx.fillStyle='#94a3b8';cx.font='9px JetBrains Mono,monospace';cx.textAlign='center';
+      cx.fillText(v+unit,x+w/2,c.height-6);
+    }
+  });
+}
+
+// Auto-refresh active tab every 5s
+setInterval(()=>{
+  const active=document.querySelector('.tab-btn.active');
+  if(!active) return;
+  const txt=active.textContent;
+  if(txt.includes('Hive')) loadHive();
+  else if(txt.includes('Economy')) loadEconomy();
+  else if(txt.includes('Metrics')) loadMetrics();
+},5000);
+
+// ── Result Tab ───────────────────────────────────────────────────────────────
+let _currentResultHtml='';
+let _currentResultJobId='';
+
+async function loadResults(){
+  const list=document.getElementById('result-list');
+  try{
+    const r=await fetch('/api/results');
+    const d=await r.json();
+    if(!d.results||!d.results.length){
+      list.innerHTML='<div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No results yet — run a job first</div>';
+      return;
+    }
+    list.innerHTML=d.results.map(res=>{
+      const short=res.job_id.slice(0,12);
+      const fixBadge=res.has_fix?'<span class="result-badge">✓ fixed</span>':'';
+      return `<div class="result-item" onclick="loadResult('${res.job_id}',this)">
+        <span style="font-size:16px">📄</span>
+        <span class="result-job">${short}…</span>
+        <span class="result-src">${res.source}</span>
+        ${fixBadge}
+      </div>`;
+    }).join('');
+  }catch(e){
+    list.innerHTML='<div style="color:var(--red);padding:12px">Error loading results</div>';
+  }
+}
+
+async function loadResult(jobId,el){
+  // Active state
+  document.querySelectorAll('.result-item').forEach(i=>i.classList.remove('active'));
+  if(el) el.classList.add('active');
+  _currentResultJobId=jobId;
+
+  const preview=document.getElementById('result-preview');
+  preview.innerHTML='<div style="color:var(--text3);padding:20px;text-align:center">Loading…</div>';
+
+  try{
+    const r=await fetch('/api/result/'+jobId);
+    const d=await r.json();
+    if(!d.ok){
+      preview.innerHTML=`<div style="color:var(--red);padding:20px">${d.error}</div>`;
+      return;
+    }
+    _currentResultHtml=d.html;
+    document.getElementById('result-actions').style.display='flex';
+    showPreviewContent();
+  }catch(e){
+    preview.innerHTML='<div style="color:var(--red);padding:20px">Error loading result</div>';
+  }
+}
+
+function showPreviewContent(){
+  const preview=document.getElementById('result-preview');
+  const blob=new Blob([_currentResultHtml],{type:'text/html'});
+  const url=URL.createObjectURL(blob);
+  preview.innerHTML=`<iframe src="${url}" class="result-frame" style="flex:1;width:100%"></iframe>`;
+  document.getElementById('btn-preview').classList.add('active');
+  document.getElementById('btn-source').classList.remove('active');
+}
+
+function showPreview(btn){
+  showPreviewContent();
+}
+
+function showSource(btn){
+  const preview=document.getElementById('result-preview');
+  const escaped=_currentResultHtml.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  preview.innerHTML=`<div class="result-code" style="flex:1">${escaped}</div>`;
+  document.getElementById('btn-source').classList.add('active');
+  document.getElementById('btn-preview').classList.remove('active');
+}
+
+function openInNewTab(){
+  if(!_currentResultHtml) return;
+  const blob=new Blob([_currentResultHtml],{type:'text/html'});
+  window.open(URL.createObjectURL(blob),'_blank');
 }
 </script>
 </body>

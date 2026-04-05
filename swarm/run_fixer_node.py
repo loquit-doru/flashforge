@@ -28,6 +28,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from swarm.foxmq_node import FoxMQNode
 from swarm.bid_protocol import BidProtocol
 from swarm.poc_logger import PoCLogger
+from swarm.hive_memory import make_hive_payload, HIVE_TOPIC
 
 NODE_ID = os.getenv("NODE_ID", f"fixer-{uuid.uuid4().hex[:8]}")
 FOXMQ_HOST = os.getenv("FOXMQ_HOST", "127.0.0.1")
@@ -111,6 +112,18 @@ async def main() -> None:
                     "output": str(fixed_path),
                 })
                 print(f"[fixer]   ✓ Fixed — {len(fix_result.fixes_applied)} fixes applied → {fixed_path}")
+
+                # Publish to Hive Memory — share fix results
+                await node.publish(HIVE_TOPIC, make_hive_payload(
+                    namespace="fix", key=f"result:{root_job_id[:8]}",
+                    value={
+                        "fixes_applied": fix_result.fixes_applied,
+                        "iterations": fix_result.iterations,
+                        "output_path": str(fixed_path),
+                        "html_bytes": len(fix_result.html),
+                    },
+                    author_id=NODE_ID, author_role="fixer", job_id=root_job_id,
+                ))
             else:
                 poc.record("FIX_PARTIAL", NODE_ID, {"error": fix_result.error})
                 print(f"[fixer]   ⚠ Partial fix — {fix_result.error}")
@@ -141,4 +154,16 @@ if __name__ == "__main__":
     import sys
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except SystemExit as e:
+            if e.code == 42:
+                import time as _time
+                NODE_ID = f"fixer-{uuid.uuid4().hex[:8]}"
+                print(f"[fixer] 🔄 Auto-respawn in 3s as {NODE_ID[:12]}…")
+                _time.sleep(3)
+                continue
+            raise

@@ -97,6 +97,7 @@ python swarm/warmup_demo.py
 ```bash
 python swarm/dashboard_server.py
 # → open http://localhost:5050
+# Tabs: Peers, Jobs, Events, PoC, Hive Memory, Agent Economy, Coordination Metrics
 ```
 
 ### Docker (everything in one command)
@@ -105,6 +106,36 @@ cp .env.example .env   # add GROQ_API_KEY
 docker compose up      # foxmq + planner + builder + critic + critic2 + fixer + dashboard
 # Dashboard: http://localhost:5050
 ```
+
+---
+
+## 6. Hive Memory
+> *Decentralized shared state — agents share intermediate context without a central database.*
+
+| What | Where |
+|------|-------|
+| HiveMemory store (FIFO eviction, TTL, namespace partitioning) | [`swarm/hive_memory.py`](swarm/hive_memory.py) — `HiveMemory` |
+| Namespace partitioning (plan/build/eval/fix/meta) | [`swarm/hive_memory.py`](swarm/hive_memory.py) — `HiveEntry.namespace` |
+| `make_hive_payload()` helper for agents | [`swarm/hive_memory.py`](swarm/hive_memory.py) — `make_hive_payload()` |
+| Planner publishes plan context after planning | [`swarm/run_planner_node.py`](swarm/run_planner_node.py) |
+| Builder publishes build metadata after build | [`swarm/run_builder_node.py`](swarm/run_builder_node.py) |
+| Critic publishes evaluation consensus | [`swarm/run_critic_node.py`](swarm/run_critic_node.py) — `_publish_consensus()` |
+| Fixer publishes fix results | [`swarm/run_fixer_node.py`](swarm/run_fixer_node.py) |
+| Dashboard Hive Memory tab (namespace bars, entry browser) | [`swarm/dashboard_server.py`](swarm/dashboard_server.py) — `/api/hive` |
+
+---
+
+## 7. Agent Economy
+> *Reputation and credit tracking — emergent agent market dynamics.*
+
+| What | Where |
+|------|-------|
+| AgentProfile (reputation, credits, tier) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — `AgentProfile` |
+| AgentEconomy state machine (deterministic scoring) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — `AgentEconomy` |
+| Reputation deltas (+15 delivery, +3 bid won, −10 failure) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — constants |
+| Tier system (novice→standard→veteran→elite) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — `_recalc_tier()` |
+| Dashboard economy leaderboard with tier badges | [`swarm/dashboard_server.py`](swarm/dashboard_server.py) — `/api/economy` |
+| Coordination latency metrics (bid, eval, pipeline) | [`swarm/dashboard_server.py`](swarm/dashboard_server.py) — `/api/coordination` |
 
 ---
 
@@ -149,12 +180,14 @@ User Prompt
 | `swarm/critic_consensus.py` | BFT supermajority vote tracker |
 | `swarm/poc_logger.py` | HMAC-chained Proof of Coordination log |
 | `swarm/verify_poc.py` | Standalone PoC verifier |
+| `swarm/hive_memory.py` | Decentralized shared state (Hive Memory) |
+| `swarm/agent_economy.py` | Agent reputation & credit tracking (Agent Economy) |
 | `swarm/warmup_demo.py` | Warm-Up proof (discovery + heartbeat + stale + recovery) |
-| `swarm/dashboard_server.py` | Real-time observability dashboard (FastAPI SSE) |
-| `swarm/run_planner_node.py` | Planner agent node |
-| `swarm/run_builder_node.py` | Builder agent node |
-| `swarm/run_critic_node.py` | Critic agent node (multi-critic BFT) |
-| `swarm/run_fixer_node.py` | Fixer agent node |
+| `swarm/dashboard_server.py` | Real-time observability dashboard (FastAPI SSE) with Hive Memory, Economy, and Metrics tabs |
+| `swarm/run_planner_node.py` | Planner agent node (publishes plan context to Hive Memory) |
+| `swarm/run_builder_node.py` | Builder agent node (publishes build metadata to Hive Memory) |
+| `swarm/run_critic_node.py` | Critic agent node (multi-critic BFT, publishes consensus to Hive Memory) |
+| `swarm/run_fixer_node.py` | Fixer agent node (publishes fix results to Hive Memory) |
 | `swarm/job_injector.py` | Job submission CLI |
 | `Dockerfile.foxmq` | Linux FoxMQ broker container |
 | `Dockerfile.swarm` | Python agent container |

@@ -56,6 +56,9 @@ A user submits a natural-language prompt (e.g., *"Build a todo list app with dar
 | ✅ Security | HMAC-SHA256 per message, nonce ring 10K, timestamp TTL 2 min |
 | ✅ Auditability | Standalone `verify_poc.py` verifier, no FoxMQ needed |
 | ✅ Developer clarity | One-command Docker Compose, live dashboard at :5050 |
+| ✅ Hive Memory | Decentralized shared state — agents publish plan/build/eval/fix context to `swarm/HIVE_MEMORY`, no central DB |
+| ✅ Agent Economy | Reputation + credits tracked per agent; tiers (novice→elite), deterministic scoring from MQTT events |
+| ✅ Coordination Metrics | Real-time latency tracking (bid, eval, pipeline), overhead analysis in dashboard |
 
 ---
 
@@ -106,7 +109,37 @@ docker compose up --build
 docker compose run --rm injector "Build a landing page for a coffee shop"
 ```
 
-**Live dashboard:** `http://localhost:5050` — shows peer topology, BFT vote table, live event stream, PoC viewer.
+**Live dashboard:** `http://localhost:5050` — shows peer topology, BFT vote table, live event stream, PoC viewer, Hive Memory browser, Agent Economy leaderboard, and Coordination Metrics.
+
+### 6. Hive Memory — Decentralized Shared State
+
+Agents share intermediate state through FoxMQ without a central database. Each agent publishes context to `swarm/HIVE_MEMORY` after completing its work phase:
+
+- **Planner** → plan context (app type, complexity, components)
+- **Builder** → build metadata (HTML size, build time, features)
+- **Critic** → evaluation consensus (verdict, scores, pass rate)
+- **Fixer** → fix results (fixes applied, iterations)
+
+Memory is partitioned by namespace (`plan/build/eval/fix/meta`), has TTL-based expiration, and FIFO eviction at 500 entries. Any agent can query the hive for context from prior pipeline stages.
+
+**File:** [`swarm/hive_memory.py`](swarm/hive_memory.py)
+
+### 7. Agent Economy — Reputation & Credits
+
+Every agent builds a reputation profile tracked deterministically from MQTT events:
+
+| Event | Reputation | Credits |
+|-------|-----------|---------|
+| Task delivery | +15 | +10 |
+| Bid won | +3 | — |
+| Consensus led | +8 | — |
+| Evaluation cast | +2 | +5 |
+| Failure | -10 | — |
+| Timeout | -5 | — |
+
+Agents are ranked into tiers: **Novice** (0-49) → **Standard** (50-99) → **Veteran** (100-199) → **Elite** (200+). The economy dashboard tab shows a live leaderboard with tier badges, reputation bars, credit balances, and event feed.
+
+**File:** [`swarm/agent_economy.py`](swarm/agent_economy.py)
 
 **Warm-up demo (single command):**
 ```bash

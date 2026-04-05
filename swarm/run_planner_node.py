@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from swarm.foxmq_node import FoxMQNode
 from swarm.bid_protocol import BidProtocol
 from swarm.poc_logger import PoCLogger
+from swarm.hive_memory import make_hive_payload, HIVE_TOPIC
 
 NODE_ID = os.getenv("NODE_ID", f"planner-{uuid.uuid4().hex[:8]}")
 FOXMQ_HOST = os.getenv("FOXMQ_HOST", "127.0.0.1")
@@ -72,6 +73,19 @@ async def main() -> None:
                 context={"plan": plan_dict},
                 job_id=f"{job_id}:build",
             )
+
+            # Publish to Hive Memory — share planning context with the swarm
+            await node.publish(HIVE_TOPIC, make_hive_payload(
+                namespace="plan", key=f"plan:{job_id[:8]}",
+                value={
+                    "app_type": plan_dict.get("app_type"),
+                    "complexity": plan_dict.get("complexity"),
+                    "components": plan_dict.get("components", [])[:5],
+                    "prompt_summary": prompt[:100],
+                },
+                author_id=NODE_ID, author_role="planner", job_id=job_id,
+            ))
+
             print(f"[planner] ✓ Plan ready — announced building task for job {job_id[:8]}")
 
         except Exception as exc:
@@ -96,4 +110,16 @@ if __name__ == "__main__":
     import sys
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except SystemExit as e:
+            if e.code == 42:
+                import time as _time
+                NODE_ID = f"planner-{uuid.uuid4().hex[:8]}"
+                print(f"[planner] 🔄 Auto-respawn in 3s as {NODE_ID[:12]}…")
+                _time.sleep(3)
+                continue
+            raise

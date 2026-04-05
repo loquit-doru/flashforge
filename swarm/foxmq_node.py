@@ -104,6 +104,20 @@ class FoxMQNode:
         await self.publish("PEER_ANNOUNCE", {"role": self.role})
         asyncio.create_task(self._heartbeat_loop())
 
+        # Listen for remote kill signal (resilience demo)
+        async def _handle_kill(msg: dict) -> None:
+            target = msg.get("payload", {}).get("target_id", "")
+            if target == self.node_id:
+                print(
+                    f"[{self.role}:{self.node_id[:8]}] 💀 KILL_SIGNAL received — "
+                    f"shutting down for resilience demo"
+                )
+                await self.stop()
+                # Raise SystemExit so the auto-respawn wrapper can restart us
+                raise SystemExit(42)
+
+        self.on("KILL_SIGNAL", _handle_kill)
+
     async def stop(self) -> None:
         """Graceful shutdown."""
         self._running = False

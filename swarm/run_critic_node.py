@@ -34,6 +34,7 @@ from swarm.foxmq_node import FoxMQNode
 from swarm.bid_protocol import BidProtocol
 from swarm.poc_logger import PoCLogger
 from swarm.critic_consensus import CriticConsensus, ConsensusResult, Vote
+from swarm.hive_memory import make_hive_payload, HIVE_TOPIC
 
 NODE_ID          = os.getenv("NODE_ID",          f"critic-{uuid.uuid4().hex[:8]}")
 FOXMQ_HOST       = os.getenv("FOXMQ_HOST",       "127.0.0.1")
@@ -232,6 +233,19 @@ async def main() -> None:
             "quorum":    _trackers[job_id].quorum if job_id in _trackers else 1,
         })
 
+        # Publish to Hive Memory — share evaluation consensus
+        await node.publish(HIVE_TOPIC, make_hive_payload(
+            namespace="eval", key=f"consensus:{root_job_id[:8]}",
+            value={
+                "verdict": "PASS" if verdict_pass else "FAIL",
+                "avg_score": round(avg_score, 2),
+                "n_votes": len(vote_summary),
+                "quorum_met": True,
+                "pass_rate": round(sum(1 for v in votes if v.passed) / max(len(votes), 1) * 100, 1),
+            },
+            author_id=NODE_ID, author_role="critic", job_id=root_job_id,
+        ))
+
         poc = PoCLogger(root_job_id, SWARM_SECRET, POC_LOG_DIR)
         tracker = _trackers.get(job_id)
         poc.record("EVAL_CONSENSUS", NODE_ID, {
@@ -294,4 +308,16 @@ async def main() -> None:
 if __name__ == "__main__":
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except SystemExit as e:
+            if e.code == 42:
+                import time as _time
+                NODE_ID = f"critic-{uuid.uuid4().hex[:8]}"
+                print(f"[critic] 🔄 Auto-respawn in 3s as {NODE_ID[:12]}…")
+                _time.sleep(3)
+                continue
+            raise
