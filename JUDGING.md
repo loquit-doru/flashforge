@@ -68,8 +68,12 @@ python swarm/verify_poc.py poc_logs/poc_<job_id>.jsonl
 
 ### Quick Start (local, 6 terminals)
 ```bash
-# Terminal 1 — FoxMQ broker
-.\foxmq.exe run --secret-key-file=foxmq.d/key_0.pem --allow-anonymous-login
+# Terminal 1 — FoxMQ 3-node cluster
+.\foxmq.exe run --allow-anonymous-login -f foxmq.d/key_0.pem -L 0.0.0.0:1883 -C 0.0.0.0:19793 foxmq.d
+# Terminal 1b
+.\foxmq.exe run --allow-anonymous-login -f foxmq.d/key_1.pem -L 0.0.0.0:1884 -C 0.0.0.0:19794 foxmq.d
+# Terminal 1c
+.\foxmq.exe run --allow-anonymous-login -f foxmq.d/key_2.pem -L 0.0.0.0:1885 -C 0.0.0.0:19795 foxmq.d
 
 # Terminal 2 — Planner
 python swarm/run_planner_node.py
@@ -77,13 +81,16 @@ python swarm/run_planner_node.py
 # Terminal 3 — Builder
 python swarm/run_builder_node.py
 
-# Terminal 4 — Critic 1 (CRITICS_EXPECTED=2 for BFT demo)
-CRITICS_EXPECTED=2 python swarm/run_critic_node.py
+# Terminal 4 — Critic 1 (CRITICS_EXPECTED=3 for BFT quorum)
+CRITICS_EXPECTED=3 python swarm/run_critic_node.py
 
-# Terminal 5 — Critic 2 (second vote for quorum)
-CRITICS_EXPECTED=2 NODE_ID=critic-002 python swarm/run_critic_node.py
+# Terminal 5 — Critic 2
+CRITICS_EXPECTED=3 NODE_ID=critic-002 python swarm/run_critic_node.py
 
-# Terminal 6 — Inject job
+# Terminal 6 — Critic 3
+CRITICS_EXPECTED=3 NODE_ID=critic-003 python swarm/run_critic_node.py
+
+# Terminal 7 — Inject job
 python swarm/job_injector.py "Build a portfolio website for a blockchain developer"
 ```
 

@@ -28,17 +28,29 @@ RUN set -ex; \
     rm -f foxmq.tar.gz
 
 # Entrypoint: generate address book once (idempotent), then start broker
+# Supports multi-node clusters via NODE_INDEX and CLUSTER_NODES env vars.
 COPY <<'EOF' /app/docker-entrypoint.sh
 #!/bin/sh
 set -e
 cd /app
-if [ ! -f foxmq.d/key_0.pem ]; then
-    echo "[foxmq] Generating address book (first start)..."
-    ./foxmq address-book from-range 127.0.0.1 19793 19793
+NODE_INDEX=${NODE_INDEX:-0}
+CLUSTER_NODES=${CLUSTER_NODES:-"127.0.0.1:19793"}
+
+# Only node 0 generates the address book (shared volume)
+if [ "$NODE_INDEX" = "0" ] && [ ! -f foxmq.d/key_0.pem ]; then
+    echo "[foxmq] Node 0: generating address book for cluster: $CLUSTER_NODES"
+    ./foxmq address-book from-list -O foxmq.d -f $CLUSTER_NODES
     echo "[foxmq] Address book generated."
 fi
-echo "[foxmq] Starting broker — MQTT :1883 | Vertex BFT UDP :19793"
-exec ./foxmq run --secret-key-file=foxmq.d/key_0.pem --allow-anonymous-login
+
+# Other nodes wait for node 0 to generate their key
+while [ ! -f "foxmq.d/key_${NODE_INDEX}.pem" ]; do
+    echo "[foxmq] Node $NODE_INDEX: waiting for key_${NODE_INDEX}.pem..."
+    sleep 1
+done
+
+echo "[foxmq] Starting node $NODE_INDEX — MQTT :1883 | Vertex BFT UDP :19793"
+exec ./foxmq run --secret-key-file="foxmq.d/key_${NODE_INDEX}.pem" --allow-anonymous-login --cluster-addr 0.0.0.0:19793
 EOF
 RUN chmod +x /app/docker-entrypoint.sh
 

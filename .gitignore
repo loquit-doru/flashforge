@@ -100,3 +100,5 @@ tests/
 
 # Seedstr private key (not published)
 seedstr_client.py
+planner_err.txt
+planner_out.txt

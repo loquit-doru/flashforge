@@ -20,11 +20,11 @@ https://github.com/loquit-doru/flashforge
 
 > Paste this into the "Project Description" field on DoraHacks.
 
-FlashForge is a **leaderless multi-agent coordination system** built natively on **FoxMQ + Tashi Vertex BFT consensus**. It does exactly what Track 3 asks for, but applied to a concrete real-world use case: autonomous full-stack app generation.
+FlashForge is a **leaderless multi-agent coordination system** built natively on a **3-node FoxMQ cluster with Tashi Vertex BFT consensus**. It does exactly what Track 3 asks for, but applied to a concrete real-world use case: autonomous full-stack app generation.
 
 ### What it does
 
-A user submits a natural-language prompt (e.g., *"Build a todo list app with dark theme"*). Four specialized AI agents — Planner, Builder, Critic ×3, Fixer — receive the job through FoxMQ and self-organize to complete it. There is no master orchestrator. Every agent is an independent process that bids for the task, commits to it, executes it, and records the event on a tamper-evident chain.
+A user submits a natural-language prompt (e.g., *"Build a todo list app with dark theme"*). Six autonomous AI agents — Planner, Builder, 3 Critics (BFT voters), Fixer — receive the job through FoxMQ and self-organize to complete it. There is no master orchestrator. Every agent is an independent process that bids for the task, commits to it, executes it, and records the event on a tamper-evident chain.
 
 ### The negotiate → commit → execute → verify loop
 
@@ -37,20 +37,20 @@ A user submits a natural-language prompt (e.g., *"Build a todo list app with dar
 
 ### FoxMQ / Vertex integration points
 
-- **All inter-agent messages** go through the FoxMQ MQTT 5.0 broker (QoS 1, BFT ordered delivery).
-- **Vertex BFT consensus** inside FoxMQ ensures every agent sees messages in the exact same order — eliminating coordination races at the transport level.
-- **Peer discovery**: `PEER_ANNOUNCE` + periodic `HEARTBEAT` (2 s interval, `PEER_STALE_AFTER=10 s`).
+- **All inter-agent messages** go through a **3-node FoxMQ cluster** (MQTT 5.0, QoS 1, BFT ordered delivery).
+- **Vertex BFT consensus** across the 3 FoxMQ brokers ensures every agent sees messages in the exact same order — eliminating coordination races at the transport level.
+- **Peer discovery**: agents announce via `PEER_ANNOUNCE` on MQTT topics + periodic `HEARTBEAT` (2 s interval, `PEER_STALE_AFTER=10 s`).
 - **Node failure**: stale node detected via missed heartbeats → orphaned task re-announced with `ORPHAN_TIMEOUT_S=30 s`.
 
 ### Track 3 requirement coverage
 
 | Requirement | Implementation |
 |-------------|----------------|
-| ✅ ≥ 3 agents, full loop | 4 agents (Planner, Builder, Critic ×3, Fixer) |
+| ✅ ≥ 3 agents, full loop | 6 agents (Planner, Builder, Critic ×3, Fixer) |
 | ✅ Discover & Form | `PEER_ANNOUNCE` + `HEARTBEAT` — ad-hoc swarms form in < 5 s |
 | ✅ Negotiate & Commit | Leaderless bid auction, 500 ms window, deterministic winner |
 | ✅ Execute & Prove | PoC HMAC-chain with multi-agent attestations |
-| ✅ FoxMQ transport | paho-mqtt over real FoxMQ broker (MQTT 5.0 + Vertex BFT) |
+| ✅ FoxMQ transport | paho-mqtt over 3-node FoxMQ cluster (MQTT 5.0 + Vertex BFT) |
 | ✅ BFT quorum (critics) | 3 critics vote independently; consensus = floor(2n/3)+1 |
 | ✅ Resilience | Stale detection, orphan timeout, automatic re-bid |
 | ✅ Security | HMAC-SHA256 per message, nonce ring 10K, timestamp TTL 2 min |
@@ -65,7 +65,7 @@ A user submits a natural-language prompt (e.g., *"Build a todo list app with dar
 ## Technical Highlights (for judges)
 
 ### 1. Coordination Correctness
-The bid winner is computed by `min(load_score, timestamp_ms, node_id)` — a pure function applied identically by every bidder. No vote is needed. Vertex BFT ordering in FoxMQ guarantees every node saw the same set of bids in the same order before the 500 ms window closes.
+The bid winner is computed by `min(load_score, timestamp_ms, node_id)` — a pure function applied identically by every bidder. No vote is needed. The 3-node FoxMQ cluster with Vertex BFT ordering guarantees every node saw the same set of bids in the same order before the 500 ms window closes.
 
 **File:** [`swarm/bid_protocol.py`](swarm/bid_protocol.py) → `_evaluate_bids()`
 
@@ -137,7 +137,7 @@ Every agent builds a reputation profile tracked deterministically from MQTT even
 | Failure | -10 | — |
 | Timeout | -5 | — |
 
-Agents are ranked into tiers: **Novice** (0-49) → **Standard** (50-99) → **Veteran** (100-199) → **Elite** (200+). The economy dashboard tab shows a live leaderboard with tier badges, reputation bars, credit balances, and event feed.
+Agents are ranked into tiers: **Novice** (0-99) → **Standard** (100-199) → **Veteran** (200-299) → **Elite** (300+). All agents start at reputation 100 (Standard tier). The economy dashboard tab shows a live leaderboard with tier badges, reputation bars, credit balances, and event feed.
 
 **File:** [`swarm/agent_economy.py`](swarm/agent_economy.py)
 
@@ -161,7 +161,7 @@ The `warmup_proof.txt` file in the repo contains proof of the 5/5 Stateful Hands
 1. git clone https://github.com/loquit-doru/flashforge
 2. cd flashforge
 3. cp .env.example .env && echo "GROQ_API_KEY=<your-key>" >> .env
-4. docker compose up --build   # starts FoxMQ + all 4 agents + dashboard
+4. docker compose up --build   # starts 3 FoxMQ brokers + 6 agents + dashboard
 5. docker compose run --rm injector "Build a portfolio for a developer"
 6. Open http://localhost:5050 — watch bidding, coordination, and PoC build live
 7. python swarm/verify_poc.py poc_logs/poc_<job_id>.jsonl  # tamper-evident audit

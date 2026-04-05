@@ -4,10 +4,10 @@
 
 Built for the **Vertex Swarm Challenge 2026 — Track 3: Agent Economy**.
 
-FlashForge runs 4 AI agents as independent P2P processes (FoxMQ nodes). They self-organize via leaderless bidding, execute a complete build pipeline, and produce a cryptographically verifiable **Proof of Coordination** log — with no central controller.
+FlashForge runs 6 AI agent processes (4 roles) as independent P2P nodes over a 3-node FoxMQ cluster. They self-organize via leaderless bidding, execute a complete build pipeline, and produce a cryptographically verifiable **Proof of Coordination** log — with no central controller.
 
 - **ERC-8004 Registered** on Base chain
-- **4 autonomous nodes**: Planner → Builder → Critic → Fixer
+- **6 agent processes**: Planner, Builder, Critic ×3 (BFT quorum), Fixer
 - **Leaderless** — any node can announce a task; agents bid for ownership
 - **Proof of Coordination** — HMAC-chained audit log for every job
 - **Multi-LLM** — Groq → Gemini → DeepSeek → Anthropic fallback chain
@@ -82,7 +82,7 @@ flashforge/
 │   ├── llm_manager.py         # Multi-LLM fallback chain
 │   └── ...
 ├── config.py                  # Pydantic settings (SWARM_SECRET, POC_LOG_DIR, ...)
-├── docker-compose.yml         # 5 services: 4 nodes + injector
+├── docker-compose.yml         # 10 services: 3 FoxMQ brokers + 6 agents + injector
 └── Dockerfile.swarm
 ```
 
