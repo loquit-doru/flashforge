@@ -80,7 +80,7 @@ class FoxMQNode:
 
     async def start(self) -> None:
         """Connect to FoxMQ broker, subscribe swarm/#, launch heartbeat loop."""
-        self._loop      = asyncio.get_event_loop()
+        self._loop      = asyncio.get_running_loop()
         self._connected = asyncio.Event()
 
         self._client.connect(self._host, self._port, keepalive=60)

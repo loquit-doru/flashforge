@@ -113,7 +113,7 @@ class BidProtocol:
         await self.node.publish("TASK_AVAILABLE", payload)
 
         # Schedule orphan recovery: if no COMMIT seen after window + timeout, re-announce
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.call_later(
             COMMIT_WINDOW_MS / 1000 + ORPHAN_TIMEOUT_S,
             lambda: asyncio.create_task(self._check_orphan(job_id, payload)),
@@ -156,7 +156,7 @@ class BidProtocol:
         })
 
         # Schedule evaluation after commit window
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.call_later(
             COMMIT_WINDOW_MS / 1000,
             lambda: asyncio.create_task(self._evaluate_bids(job_id))
@@ -243,7 +243,7 @@ class BidProtocol:
 
         await self.node.publish("TASK_AVAILABLE", payload)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.call_later(
             COMMIT_WINDOW_MS / 1000 + ORPHAN_TIMEOUT_S,
             lambda: asyncio.create_task(self._check_orphan(job_id, payload)),
