@@ -9,7 +9,7 @@
 FlashForge Agent Swarm
 
 ## One-liner
-Leaderless AI agent swarm that discovers peers via FoxMQ/Vertex, bids on tasks without a master orchestrator, and produces a cryptographically verifiable Proof of Coordination.
+Leaderless AI agent swarm with cryptographic Proof of Coordination — the audit trail infrastructure for AI pipelines that regulators, security teams, and enterprises actually need.
 
 ## GitHub Repository
 https://github.com/loquit-doru/flashforge
@@ -20,7 +20,11 @@ https://github.com/loquit-doru/flashforge
 
 > Paste this into the "Project Description" field on DoraHacks.
 
-FlashForge is a **leaderless multi-agent coordination system** built natively on a **3-node FoxMQ cluster with Tashi Vertex BFT consensus**. It does exactly what Track 3 asks for, but applied to a concrete real-world use case: autonomous full-stack app generation.
+Companies deploying AI agents in production face a problem that regulators are starting to enforce: **you must prove what an AI agent decided, when, and why.** GDPR, SOX, and HIPAA require audit trails. Most multi-agent frameworks have no answer.
+
+FlashForge is a **leaderless multi-agent coordination system** built natively on a **3-node FoxMQ cluster with Tashi Vertex BFT consensus**. Every job produces a tamper-evident, HMAC-chained **Proof of Coordination** — a mini-blockchain proving which agent did what, in what order, with cryptographic attestations from each participant. Modify a single field and the chain breaks.
+
+Applied here to autonomous full-stack app generation, but the coordination layer is domain-agnostic: security audits, compliance pipelines, infrastructure automation — any workflow where AI decisions must be attributable and tamper-evident.
 
 ### What it does
 

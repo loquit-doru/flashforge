@@ -2,8 +2,9 @@
 
 > **Vertex Swarm Challenge 2026 · Track 3: Agent Economy**
 >
-> A production-grade, leaderless multi-agent coordination system built on **FoxMQ + Vertex BFT consensus**.
-> Agents discover each other, bid for tasks, execute in parallel, and produce a cryptographically verifiable **Proof of Coordination** — all without a central orchestrator.
+> Most multi-agent systems have a hidden coordinator. If it dies, the swarm dies.
+> FlashForge has no coordinator — agents self-organize via **FoxMQ + Vertex BFT**, bid on tasks without a master, and produce a **cryptographically verifiable Proof of Coordination** for every job.
+> Built for any pipeline where AI decisions must be auditable, resilient, and tamper-evident.
 
 ---
 
@@ -13,7 +14,33 @@ Every multi-agent system has a dirty secret: a hidden coordinator that, if it di
 
 FlashForge eliminates that. Six specialized AI agents — Planner, Builder, three Critics, and a Fixer — self-organize entirely through message passing. No master process. No single point of failure. When a node dies mid-job, the swarm detects it via missed heartbeats and reassigns the work automatically.
 
-**Real-world impact:** Autonomous software generation pipelines where uptime matters. Distributed code review systems. Any multi-agent workflow that needs a cryptographic audit trail proving exactly what ran, when, and by whom.
+---
+
+## Real-World Applications
+
+Companies deploying AI agents in production face a problem regulators are starting to enforce: **you must be able to prove what an AI agent decided, when, and why.** GDPR, SOX, and HIPAA all require audit trails. Boards demand accountability. Most multi-agent frameworks have no answer.
+
+FlashForge's Proof of Coordination is a tamper-evident, HMAC-chained log — a mini-blockchain attached to every job. You cannot falsify which agent produced which output. Three concrete scenarios where this matters today:
+
+### 1. Automated Security Audits (DevSecOps)
+
+A bank's CI/CD pipeline runs FlashForge before every production deploy. Three independent Critic agents review code for vulnerabilities — each votes separately, BFT quorum requires 2/3 agreement. The PoC log proves to the security team (and auditors) exactly which agents reviewed which commit, what scores they gave, and that no single agent could override the others.
+
+> Without FlashForge: "Our AI reviewed it." With FlashForge: cryptographic proof of *which* agents, *what* they found, *when* — verifiable by any third party with `verify_poc.py`.
+
+### 2. Regulated Content Generation (Legal / Compliance)
+
+A legal-tech firm uses AI agents to draft contract clauses. Each clause goes through Planner → Builder → Critics → Fixer. The PoC hash-chain is attached to every generated document as its provenance record — immutable proof that three independent AI reviewers evaluated and approved the output before it reached a human lawyer.
+
+> When a client asks "how was this clause generated?", the answer isn't a log file someone could edit. It's a chain where modifying any entry breaks the HMAC.
+
+### 3. Distributed Infrastructure Automation (SRE / DevOps)
+
+A platform team uses a FlashForge swarm to autonomously diagnose and patch production incidents. Multiple agents bid on the incident, the winner diagnoses it, others validate the fix. If the patch causes a regression, the PoC log shows exactly which agent proposed it and which critics approved — making post-mortems fast and blame-free.
+
+> The swarm's leaderless design means no single agent (and no single vendor's API outage) can block incident resolution.
+
+---
 
 ---
 
