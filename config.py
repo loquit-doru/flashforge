@@ -69,8 +69,8 @@ class Settings(BaseSettings):
     
     # LLM Configuration
     PRIMARY_LLM: LLMProvider = Field(default=LLMProvider.GROQ)
-    FALLBACK_LLM: LLMProvider = Field(default=LLMProvider.ANTHROPIC)  # Claude — best quality fallback (~$0.02/req)
-    QUALITY_LLM: LLMProvider = Field(default=LLMProvider.ANTHROPIC)  # Claude Opus 4 — best quality
+    FALLBACK_LLM: LLMProvider = Field(default=LLMProvider.GEMINI)    # Gemini 2.5 Flash — fast, free, great HTML
+    QUALITY_LLM: LLMProvider = Field(default=LLMProvider.GEMINI)     # Gemini 2.5 Flash — sub-30s HTML generation
     
     # Model Selection
     GROQ_MODEL: str = Field(default="llama-3.3-70b-versatile")
@@ -97,7 +97,7 @@ class Settings(BaseSettings):
     WEIGHT_SPEED: float = Field(default=0.20)
     
     # Quality Thresholds
-    MIN_QUALITY_SCORE: float = Field(default=80.0)
+    MIN_QUALITY_SCORE: float = Field(default=65.0)  # 65 avoids Fixer re-generation for visually complete output
     MAX_RETRY_ATTEMPTS: int = Field(default=5)
     
     @field_validator("OUTPUT_DIR", "TEMP_DIR", mode="before")
