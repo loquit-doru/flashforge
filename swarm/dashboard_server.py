@@ -271,6 +271,17 @@ async def sse(request: Request):
 
     async def gen():
         try:
+            # Send current peer snapshot immediately — prevents 1s blank on reconnect
+            now_ms = int(time.time() * 1000)
+            snapshot_evt = {
+                "type": "PEER_SNAPSHOT",
+                "peers": {
+                    nid: {"role": p["role"], "last_seen_ms": p["last_seen_ms"]}
+                    for nid, p in _peers.items()
+                },
+                "ts": now_ms,
+            }
+            yield f"data: {json.dumps(snapshot_evt)}\n\n"
             # Replay up to 50 recent events on fresh connect
             for evt in _recent_events[-50:]:
                 yield f"data: {json.dumps(evt)}\n\n"
@@ -1137,6 +1148,16 @@ function handle(m){
   if(t==='PEER_ANNOUNCE'||t==='HEARTBEAT'){
     peers[sid]={role,status:'online',seen:now};
     renderAgents();
+  }
+
+  // Bulk peer snapshot sent on SSE connect — populate instantly, no blank flash
+  if(t==='PEER_SNAPSHOT'){
+    const snap=m.peers||{};
+    Object.entries(snap).forEach(([nid,info])=>{
+      peers[nid]={role:info.role,status:'online',seen:m.ts||now};
+    });
+    renderAgents();drawNetwork();
+    return;
   }
 
   const jid=p.job_id?(p.job_id.split(':')[0]):'';
