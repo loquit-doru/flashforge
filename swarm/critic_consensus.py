@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-VOTE_WINDOW_S = 25.0  # max wait for all critic votes before timeout
+VOTE_WINDOW_S = 10.0  # max wait for all critic votes before timeout
 
 ConsensusResult = Tuple[bool, float, List["Vote"]]  # (verdict_pass, avg_score, votes)
 
@@ -104,6 +104,8 @@ class CriticConsensus:
         """Check if any verdict reached BFT quorum; if so, lock result."""
         votes      = list(self._votes.values())
         n          = len(votes)
+        if n == 0:
+            return None
         pass_count = sum(1 for v in votes if v.passed)
         fail_count = n - pass_count
         avg_score  = sum(v.score for v in votes) / n

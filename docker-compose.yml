@@ -1,7 +1,7 @@
 version: "3.9"
 
 # FlashForge Agent Swarm — Docker Compose
-# Runs 3-node FoxMQ cluster + 6 AI agent processes (4 roles) + job injector.
+# Runs 3-node FoxMQ cluster + 7 AI agent processes (planner, builder, 4× critic, fixer) + dashboard + job injector.
 # Coordination is leaderless — agents bid via FoxMQ (MQTT 5.0 + Vertex BFT).
 #
 # Usage:
@@ -136,7 +136,7 @@ services:
       <<: *common-env
       NODE_ID: critic-001
       PASS_THRESHOLD: "75"
-      CRITICS_EXPECTED: "3"   # BFT quorum: 3 critics, quorum = floor(2*3/3)+1 = 3
+      CRITICS_EXPECTED: "4"   # BFT quorum: 4 critics, quorum = floor(2*4/3)+1 = 3, tolerates 1 failure
       QUORUM_TIMEOUT_S: "20"
     depends_on:
       foxmq:
@@ -150,7 +150,7 @@ services:
       <<: *common-env
       NODE_ID: critic-002
       PASS_THRESHOLD: "75"
-      CRITICS_EXPECTED: "3"
+      CRITICS_EXPECTED: "4"
       QUORUM_TIMEOUT_S: "20"
     depends_on:
       foxmq:
@@ -164,7 +164,21 @@ services:
       <<: *common-env
       NODE_ID: critic-003
       PASS_THRESHOLD: "75"
-      CRITICS_EXPECTED: "3"
+      CRITICS_EXPECTED: "4"
+      QUORUM_TIMEOUT_S: "20"
+    depends_on:
+      foxmq:
+        condition: service_healthy
+
+  critic4:
+    <<: *common
+    container_name: ff_critic4
+    command: python swarm/run_critic_node.py
+    environment:
+      <<: *common-env
+      NODE_ID: critic-004
+      PASS_THRESHOLD: "75"
+      CRITICS_EXPECTED: "4"
       QUORUM_TIMEOUT_S: "20"
     depends_on:
       foxmq:
@@ -219,6 +233,8 @@ services:
       critic2:
         condition: service_started
       critic3:
+        condition: service_started
+      critic4:
         condition: service_started
       fixer:
         condition: service_started

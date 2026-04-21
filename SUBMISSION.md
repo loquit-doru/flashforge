@@ -28,7 +28,7 @@ Applied here to autonomous full-stack app generation, but the coordination layer
 
 ### What it does
 
-A user submits a natural-language prompt (e.g., *"Build a todo list app with dark theme"*). Six autonomous AI agents — Planner, Builder, 3 Critics (BFT voters), Fixer — receive the job through FoxMQ and self-organize to complete it. There is no master orchestrator. Every agent is an independent process that bids for the task, commits to it, executes it, and records the event on a tamper-evident chain.
+A user submits a natural-language prompt (e.g., *"Build a todo list app with dark theme"*). Seven autonomous AI agents — Planner, Builder, 4 Critics (BFT voters), Fixer — receive the job through FoxMQ and self-organize to complete it. There is no master orchestrator. Every agent is an independent process that bids for the task, commits to it, executes it, and records the event on a tamper-evident chain.
 
 ### The negotiate → commit → execute → verify loop
 
@@ -50,18 +50,18 @@ A user submits a natural-language prompt (e.g., *"Build a todo list app with dar
 
 | Requirement | Implementation |
 |-------------|----------------|
-| ✅ ≥ 3 agents, full loop | 6 agents (Planner, Builder, Critic ×3, Fixer) |
+| ✅ ≥ 3 agents, full loop | 7 agents (Planner, Builder, Critic ×4, Fixer) |
 | ✅ Discover & Form | `PEER_ANNOUNCE` + `HEARTBEAT` — ad-hoc swarms form in < 5 s |
 | ✅ Negotiate & Commit | Leaderless bid auction, 500 ms window, deterministic winner |
 | ✅ Execute & Prove | PoC HMAC-chain with multi-agent attestations |
 | ✅ FoxMQ transport | paho-mqtt over 3-node FoxMQ cluster (MQTT 5.0 + Vertex BFT) |
-| ✅ BFT quorum (critics) | 3 critics vote independently; consensus = floor(2n/3)+1 |
+| ✅ BFT quorum (critics) | 4 critics vote independently; consensus = floor(2*4/3)+1 = 3; tolerates 1 Byzantine failure |
 | ✅ Resilience | Stale detection, orphan timeout, automatic re-bid |
 | ✅ Security | HMAC-SHA256 per message, nonce ring 10K, timestamp TTL 2 min |
 | ✅ Auditability | Standalone `verify_poc.py` verifier, no FoxMQ needed |
 | ✅ Developer clarity | One-command Docker Compose, live dashboard at :5050 |
 | ✅ Hive Memory | Decentralized shared state — agents publish plan/build/eval/fix context to `swarm/HIVE_MEMORY`, no central DB |
-| ✅ Agent Economy | Reputation + credits tracked per agent; tiers (novice→elite), deterministic scoring from MQTT events |
+| ✅ Agent Economy | Reputation + credits tracked per agent; tiers (novice→elite), **reputation-weighted bidding**, **credit-based LLM spending** (Groq=1, Gemini=5, Anthropic=20) |
 | ✅ Coordination Metrics | Real-time latency tracking (bid, eval, pipeline), overhead analysis in dashboard |
 
 ---
@@ -76,7 +76,7 @@ The bid winner is computed by `min(load_score, timestamp_ms, node_id)` — a pur
 ### 2. Resilience
 - Heartbeats every 2 s; peer marked `STALE` after 10 s silence.
 - If the committed agent disappears, `ORPHAN_TIMEOUT_S` (30 s) triggers a re-announcement — another agent bids and continues the job.
-- BFT critic quorum: if 1 of 3 critics drops mid-vote, the remaining 2 still meet quorum.
+- BFT critic quorum: if 1 of 4 critics drops mid-vote, the remaining 3 still meet quorum (quorum=3).
 
 **Demo:** `python swarm/warmup_demo.py` (runs kill/revive cycle automatically)
 
@@ -165,7 +165,7 @@ The `warmup_proof.txt` file in the repo contains proof of the 5/5 Stateful Hands
 1. git clone https://github.com/loquit-doru/flashforge
 2. cd flashforge
 3. cp .env.example .env && echo "GROQ_API_KEY=<your-key>" >> .env
-4. docker compose up --build   # starts 3 FoxMQ brokers + 6 agents + dashboard
+4. docker compose up --build   # starts 3 FoxMQ brokers + 7 agents + dashboard
 5. docker compose run --rm injector "Build a portfolio for a developer"
 6. Open http://localhost:5050 — watch bidding, coordination, and PoC build live
 7. python swarm/verify_poc.py poc_logs/poc_<job_id>.jsonl  # tamper-evident audit

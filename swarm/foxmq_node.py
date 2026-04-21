@@ -34,6 +34,8 @@ HEARTBEAT_INTERVAL = 2.0     # seconds between heartbeats
 PEER_STALE_AFTER   = float(os.getenv("PEER_STALE_AFTER", "10"))  # seconds without heartbeat → marked stale
 NONCE_RING_MAX     = 10_000  # max nonces kept for replay prevention (deque auto-evicts oldest)
 MSG_TTL_MS         = 120_000 # messages older than 2 minutes are dropped (replay attack mitigation)
+RECONNECT_BASE_S   = 1.0     # initial MQTT reconnect delay
+RECONNECT_MAX_S    = 30.0    # cap exponential backoff
 
 
 class FoxMQNode:
@@ -53,6 +55,13 @@ class FoxMQNode:
         foxmq_port: int = 1883,
         hmac_secret: str = "swarm-secret-change-in-prod",
     ):
+        if not hmac_secret:
+            raise ValueError("SWARM_SECRET cannot be empty — set a strong secret.")
+        if hmac_secret == "swarm-secret-change-in-prod":
+            print(
+                f"[{role}] ⚠  WARNING: Using default SWARM_SECRET. "
+                "Set SWARM_SECRET env var to a strong value before production."
+            )
         self.node_id = node_id
         self.role = role
         self._host = foxmq_host
@@ -73,6 +82,7 @@ class FoxMQNode:
         self._peer_states: Dict[str, Dict]        = {}
         self._seen_nonces: deque                  = deque(maxlen=NONCE_RING_MAX)
         self._running = False
+        self._mqtt_connected = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._connected: Optional[asyncio.Event]        = None  # created in start()
 
@@ -103,6 +113,7 @@ class FoxMQNode:
 
         await self.publish("PEER_ANNOUNCE", {"role": self.role})
         asyncio.create_task(self._heartbeat_loop())
+        asyncio.create_task(self._reconnect_loop())
 
         # Listen for remote kill signal (resilience demo)
         async def _handle_kill(msg: dict) -> None:
@@ -128,14 +139,16 @@ class FoxMQNode:
 
     def _on_connect(self, client, userdata, connect_flags, reason_code, properties):
         client.subscribe("swarm/#", qos=1)
+        self._mqtt_connected = True
         if self._loop and self._connected:
             self._loop.call_soon_threadsafe(self._connected.set)
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        self._mqtt_connected = False
         if self._running:
             print(
                 f"[{self.role}] ⚠ Disconnected from FoxMQ "
-                f"(rc={reason_code}) — reconnecting…"
+                f"(rc={reason_code}) — reconnect loop will retry…"
             )
 
     def _on_message(self, client, userdata, msg):
@@ -190,6 +203,8 @@ class FoxMQNode:
 
     # ── Heartbeat ──────────────────────────────────────────────────────────────
 
+    _PEER_EVICT_AFTER = 300.0  # remove peers silent for 5 minutes
+
     async def _heartbeat_loop(self) -> None:
         while self._running:
             await asyncio.sleep(HEARTBEAT_INTERVAL)
@@ -198,7 +213,14 @@ class FoxMQNode:
             now_ms = int(time.time() * 1000)
             for peer_id, state in list(self._peer_states.items()):
                 age_s = (now_ms - state["last_seen_ms"]) / 1000
-                if age_s > PEER_STALE_AFTER and state["status"] == "online":
+                if age_s > self._PEER_EVICT_AFTER:
+                    del self._peer_states[peer_id]
+                    print(
+                        f"[{self.role}:{self.node_id[:8]}] 🗑  EVICTED  "
+                        f"peer={peer_id[:8]} role={state['role']} "
+                        f"silent={age_s:.0f}s"
+                    )
+                elif age_s > PEER_STALE_AFTER and state["status"] == "online":
                     state["status"] = "stale"
                     print(
                         f"[{self.role}:{self.node_id[:8]}] ⚠  STALE  "
@@ -211,6 +233,45 @@ class FoxMQNode:
                         f"[{self.role}:{self.node_id[:8]}] ✓  ONLINE  "
                         f"peer={peer_id[:8]} role={state['role']} back online"
                     )
+
+    # ── Reconnect ──────────────────────────────────────────────────────────────
+
+    async def _reconnect_loop(self) -> None:
+        """
+        Resilience: if the MQTT link drops (broker restart, network blip),
+        exponentially back off and re-connect. paho's loop_start thread handles
+        socket IO, but without an explicit reconnect() it may stay down if the
+        initial connect succeeded then died. We watch the connected flag and
+        call reconnect() until the broker accepts us again — then re-announce
+        PEER_ANNOUNCE so the mesh re-learns we exist.
+        """
+        delay = RECONNECT_BASE_S
+        while self._running:
+            await asyncio.sleep(delay)
+            if self._mqtt_connected:
+                delay = RECONNECT_BASE_S
+                continue
+            try:
+                print(
+                    f"[{self.role}:{self.node_id[:8]}] 🔄 Reconnecting to "
+                    f"FoxMQ {self._host}:{self._port} (retry in {delay:.1f}s)…"
+                )
+                self._client.reconnect()
+                # Give paho a beat to run _on_connect and flip the flag
+                await asyncio.sleep(0.5)
+                if self._mqtt_connected:
+                    print(
+                        f"[{self.role}:{self.node_id[:8]}] ✓ Reconnected — "
+                        f"re-announcing presence"
+                    )
+                    await self.publish("PEER_ANNOUNCE", {"role": self.role})
+                    delay = RECONNECT_BASE_S
+            except Exception as exc:
+                print(
+                    f"[{self.role}:{self.node_id[:8]}] ✗ Reconnect failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                delay = min(delay * 2, RECONNECT_MAX_S)
 
     # ── Publishing ─────────────────────────────────────────────────────────────
 
@@ -226,7 +287,16 @@ class FoxMQNode:
         }
         body["hmac"] = self._sign(body)
         # paho publish is thread-safe; QoS 1 = at-least-once delivery
-        self._client.publish(f"swarm/{msg_type}", json.dumps(body), qos=1)
+        try:
+            self._client.publish(f"swarm/{msg_type}", json.dumps(body), qos=1)
+        except Exception as exc:
+            # Don't crash the caller if the socket is momentarily down —
+            # _reconnect_loop will restore the link. Heartbeats will resume;
+            # critical pipeline state is reasserted by the next stage.
+            print(
+                f"[{self.role}] ⚠ publish {msg_type} failed "
+                f"({type(exc).__name__}: {exc}) — dropped"
+            )
 
     # ── Event registration ─────────────────────────────────────────────────────
 

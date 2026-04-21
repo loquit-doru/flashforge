@@ -1,4 +1,4 @@
-"""BlitzDev Agents Package"""
+"""FlashForge Agents Package"""
 
 from .planner import PlannerAgent
 from .builder import BuilderAgent

@@ -1,5 +1,5 @@
 """
-Fixer Agent for BlitzDev
+Fixer Agent for FlashForge
 Fixes issues identified by CriticAgent
 """
 
@@ -172,7 +172,7 @@ class FixerAgent:
             if "<head" in html.lower():
                 html = re.sub(
                     r'(</head>)',
-                    r'    <title>BlitzDev App</title>\n\1',
+                    r'    <title>FlashForge App</title>\n\1',
                     html,
                     flags=re.IGNORECASE
                 )
@@ -372,7 +372,7 @@ Provide only the fixed HTML:"""
             response = await self.llm.generate(
                 prompt=fix_prompt,
                 temperature=0.3,
-                provider=LLMProvider.QWEN
+                provider=LLMProvider.GEMINI
             )
             
             # Extract HTML

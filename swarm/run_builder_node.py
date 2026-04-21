@@ -26,6 +26,7 @@ from swarm.foxmq_node import FoxMQNode
 from swarm.bid_protocol import BidProtocol
 from swarm.poc_logger import PoCLogger
 from swarm.hive_memory import make_hive_payload, HIVE_TOPIC
+from swarm.agent_economy import AgentEconomy
 
 NODE_ID = os.getenv("NODE_ID", f"builder-{uuid.uuid4().hex[:8]}")
 FOXMQ_HOST = os.getenv("FOXMQ_HOST", "127.0.0.1")
@@ -45,8 +46,27 @@ async def main() -> None:
         return min(_active_tasks / 4.0, 1.0)
 
     node = FoxMQNode(NODE_ID, "builder", FOXMQ_HOST, FOXMQ_PORT, SWARM_SECRET)
-    bidder = BidProtocol(node, capability="building", load_fn=_get_load)
+    economy = AgentEconomy()
+    bidder = BidProtocol(node, capability="building", load_fn=_get_load, economy=economy)
     builder = BuilderAgent()
+
+    # Economy hook: deduct credits + broadcast LLM_SPENT on every LLM call
+    def _on_llm_spend(provider: str) -> None:
+        economy.spend_credits(NODE_ID, "builder", provider)
+        asyncio.get_event_loop().call_soon(
+            lambda: asyncio.create_task(node.publish("LLM_SPENT", {
+                "agent_id": NODE_ID, "provider": provider,
+            }))
+        )
+    builder.llm.set_spend_hook(_on_llm_spend)
+
+    # Wire economy into MQTT events — every node maintains a local replica
+    for evt in ("COMMIT", "PLAN_READY", "BUILD_COMPLETE", "EVAL_VOTE",
+                "EVAL_CONSENSUS", "FIX_COMPLETE", "LLM_SPENT", "PEER_ANNOUNCE"):
+        node.on(evt, lambda msg, _et=evt: economy.process_swarm_event(
+            _et, msg.get("sender_id", ""), msg.get("sender_role", ""),
+            msg.get("payload", {}),
+        ))
 
     # job_id of build task → original job_id (for PoC log continuity)
     build_to_root: dict[str, str] = {}

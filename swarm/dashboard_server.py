@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 
 import paho.mqtt.client as mqtt
@@ -81,6 +82,9 @@ _coordination_metrics = {
     "uptime_start_ms": int(time.time() * 1000),
 }
 _task_timestamps: dict = {}   # job_id → {announced_ms, committed_ms, eval_start_ms, consensus_ms, done_ms}
+
+# Lock protects all shared mutable state from concurrent paho-thread writes + asyncio reads
+_state_lock = threading.Lock()
 
 
 def _update_job_state(msg_type: str, payload: dict) -> None:
@@ -163,34 +167,40 @@ def _paho_on_message(client, userdata, msg) -> None:
         data = json.loads(msg.payload)
     except Exception:
         return
-    _recent_events.append(data)
-    if len(_recent_events) > 200:
-        _recent_events.pop(0)
+    try:
+        msg_type    = data.get("type", "")
+        payload     = data.get("payload", {})
+        sender_id   = data.get("sender_id", "")
+        sender_role = data.get("sender_role", "")
 
-    # Update job state machine + metrics
-    msg_type = data.get("type", "")
-    payload  = data.get("payload", {})
-    _update_job_state(msg_type, payload)
+        # All shared-state mutations under lock (paho thread vs asyncio reads)
+        with _state_lock:
+            # Don't store HEARTBEATs in the event buffer — they flood out
+            # pipeline events.  HBs are still broadcast live via SSE and
+            # tracked in _peers.
+            if msg_type != "HEARTBEAT":
+                _recent_events.append(data)
+                if len(_recent_events) > 500:
+                    _recent_events.pop(0)
 
-    # Update peer registry for metrics
-    sender_id   = data.get("sender_id", "")
-    sender_role = data.get("sender_role", "")
-    if sender_id and msg_type in ("PEER_ANNOUNCE", "HEARTBEAT"):
-        _peers[sender_id] = {"role": sender_role, "last_seen_ms": int(time.time() * 1000)}
-    _metrics["peers_online"] = sum(
-        1 for p in _peers.values()
-        if (int(time.time() * 1000) - p["last_seen_ms"]) / 1000 < 12
-    )
+            _update_job_state(msg_type, payload)
 
-    # Feed Hive Memory
-    if msg_type == HIVE_TOPIC:
-        _hive.put_from_payload(payload)
+            if sender_id and msg_type in ("PEER_ANNOUNCE", "HEARTBEAT"):
+                _peers[sender_id] = {"role": sender_role, "last_seen_ms": int(time.time() * 1000)}
+            _metrics["peers_online"] = sum(
+                1 for p in _peers.values()
+                if (int(time.time() * 1000) - p["last_seen_ms"]) / 1000 < 12
+            )
 
-    # Feed Agent Economy (deterministic — same events → same state)
-    _economy.process_swarm_event(msg_type, sender_id, sender_role, payload)
+            if msg_type == HIVE_TOPIC:
+                _hive.put_from_payload(payload)
 
-    if _loop:
-        asyncio.run_coroutine_threadsafe(_broadcast(data), _loop)
+            _economy.process_swarm_event(msg_type, sender_id, sender_role, payload)
+
+        if _loop and _loop.is_running():
+            asyncio.run_coroutine_threadsafe(_broadcast(data), _loop)
+    except Exception as e:
+        print(f"[dashboard] ERROR in message handler: {e}")
 
 
 async def _broadcast(msg: dict) -> None:
@@ -215,13 +225,27 @@ def _start_mqtt() -> None:
     )
     client.on_connect = _mqtt_on_connect
     client.on_message = _paho_on_message
-    try:
-        client.connect(FOXMQ_HOST, FOXMQ_PORT, keepalive=60)
-        client.loop_start()
-        _mqtt_client = client
-        print(f"[dashboard] OK MQTT -> FoxMQ {FOXMQ_HOST}:{FOXMQ_PORT}")
-    except Exception as e:
-        print(f"[dashboard] WARN Cannot connect to FoxMQ: {e} -- dashboard will show live events once broker starts")
+    client.connect(FOXMQ_HOST, FOXMQ_PORT, keepalive=60)
+    client.loop_start()
+    _mqtt_client = client
+    print(f"[dashboard] OK MQTT -> FoxMQ {FOXMQ_HOST}:{FOXMQ_PORT}")
+
+
+async def _mqtt_reconnect_loop() -> None:
+    """Background task: retry MQTT connection if initial startup failed."""
+    global _mqtt_client
+    wait = 2.0
+    while True:
+        await asyncio.sleep(wait)
+        connected = _mqtt_client is not None and _mqtt_client.is_connected()
+        if not connected:
+            try:
+                _start_mqtt()
+                print("[dashboard] MQTT reconnected successfully")
+                wait = 2.0
+            except Exception as e:
+                wait = min(wait * 2, 60)
+                print(f"[dashboard] MQTT reconnect failed, retry in {wait:.0f}s: {e}")
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -232,7 +256,11 @@ app = FastAPI(title="FlashForge Swarm Dashboard")
 async def startup() -> None:
     global _loop
     _loop = asyncio.get_event_loop()
-    _start_mqtt()
+    try:
+        _start_mqtt()
+    except Exception as e:
+        print(f"[dashboard] WARN Cannot connect to FoxMQ: {e} — will retry in background")
+    asyncio.create_task(_mqtt_reconnect_loop())
 
 
 # ── SSE endpoint ───────────────────────────────────────────────────────────────
@@ -274,8 +302,10 @@ async def api_events():
 async def api_jobs():
     """Job state machine — shows each job's current stage and timing."""
     now_ms = int(time.time() * 1000)
+    with _state_lock:
+        snapshot = list(_job_states.items())
     jobs = []
-    for job_id, state in _job_states.items():
+    for job_id, state in snapshot:
         age_s = (now_ms - state["started_ms"]) / 1000
         jobs.append({
             "job_id":     job_id,
@@ -475,21 +505,56 @@ async def api_result(job_id: str):
 async def api_results():
     """List all job results available on disk."""
     results = []
+    seen = set()
     for base in [
         os.path.join(os.getcwd(), "swarm_output"),
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "swarm_output"),
     ]:
         if not os.path.isdir(base):
             continue
-        for name in sorted(os.listdir(base), reverse=True):
-            d = os.path.join(base, name)
+        dirs = [(name, os.path.join(base, name)) for name in os.listdir(base)]
+        dirs.sort(key=lambda nd: os.path.getmtime(nd[1]), reverse=True)
+        for name, d in dirs:
             if not os.path.isdir(d):
                 continue
             fixed = os.path.isfile(os.path.join(d, "index_fixed.html"))
             original = os.path.isfile(os.path.join(d, "index.html"))
             if fixed or original:
-                results.append({"job_id": name, "has_fix": fixed, "source": "index_fixed.html" if fixed else "index.html"})
+                if name not in seen:
+                    seen.add(name)
+                    results.append({"job_id": name, "has_fix": fixed, "source": "index_fixed.html" if fixed else "index.html"})
     return {"results": results}
+
+
+@app.post("/admin/reset")
+async def admin_reset():
+    """Reset all in-memory state — clean slate for recordings."""
+    with _state_lock:
+        _peers.clear()
+        _recent_events.clear()
+        _job_states.clear()
+        _hive.__init__()
+        _economy.__init__()
+        for k in _metrics:
+            _metrics[k] = 0
+        _coordination_metrics["bid_latencies_ms"].clear()
+        _coordination_metrics["eval_latencies_ms"].clear()
+        _coordination_metrics["total_pipeline_time_ms"].clear()
+        _coordination_metrics["total_jobs_completed"] = 0
+        _coordination_metrics["avg_bid_latency_ms"] = 0
+        _coordination_metrics["avg_eval_latency_ms"] = 0
+        _coordination_metrics["avg_pipeline_time_ms"] = 0
+        _coordination_metrics["messages_per_second"] = 0
+        _coordination_metrics["uptime_start_ms"] = int(time.time() * 1000)
+    # Broadcast RESET to all connected SSE clients so browser clears UI
+    reset_evt = {"type": "RESET", "sender_id": "dashboard", "sender_role": "dashboard", "payload": {}, "ts": time.time()}
+    for q in list(_client_queues):
+        try:
+            q.put_nowait(reset_evt)
+        except Exception:
+            pass
+    print("[dashboard] 🔄 STATE RESET — clean slate")
+    return {"ok": True, "message": "All state cleared"}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -740,14 +805,14 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .eco-evt-delta{font-family:'JetBrains Mono',monospace;font-size:10px;min-width:50px;text-align:right}
 
 /* ── Result preview ── */
-.result-list{display:flex;flex-direction:column;gap:8px;margin-bottom:12px}
+.result-list{display:flex;flex-direction:column;gap:8px;margin-bottom:12px;max-height:calc(100vh - 260px);overflow-y:auto}
 .result-item{display:flex;align-items:center;gap:10px;background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:8px 12px;cursor:pointer;transition:border-color .2s}
 .result-item:hover{border-color:var(--blue)}
 .result-item.active{border-color:var(--blue);box-shadow:var(--glow-blue)}
 .result-job{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);flex:1}
 .result-src{font-size:10px;color:var(--text3)}
 .result-badge{font-size:10px;padding:2px 8px;border-radius:6px;background:rgba(16,185,129,.15);color:var(--green2);border:1px solid rgba(16,185,129,.3)}
-.result-frame{width:100%;border:1px solid var(--border);border-radius:8px;background:#fff;min-height:300px}
+.result-frame{width:100%;border:1px solid var(--border);border-radius:8px;background:#fff;height:calc(100vh - 260px)}
 .result-code{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text2);max-height:300px;overflow:auto;white-space:pre-wrap;word-break:break-all}
 .result-actions{display:flex;gap:8px;margin-bottom:8px}
 .result-actions button{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px;transition:border-color .2s}
@@ -969,13 +1034,13 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 
 <!-- Result Tab -->
 <div id="tab-result" class="tab-panel">
-  <div class="grid2" style="height:100%">
+  <div class="grid2" style="height:calc(100vh - 150px)">
     <div class="card" style="display:flex;flex-direction:column">
       <div class="card-hdr">
         <span class="card-title">📁 Built Artifacts</span>
         <button onclick="loadResults()" style="background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 12px;border-radius:6px;cursor:pointer;font-size:11px">↻ Refresh</button>
       </div>
-      <div id="result-list" class="result-list" style="flex:1;overflow-y:auto">
+      <div id="result-list" class="result-list">
         <div style="color:var(--text3);font-size:12px;padding:12px;text-align:center">No results yet — run a job first</div>
       </div>
     </div>
@@ -1052,6 +1117,22 @@ es.onmessage=e=>{
 function handle(m){
   const{type:t,sender_id:sid,sender_role:role,payload:p={}}=m;
   const now=Date.now();
+
+  // Full UI reset when server sends RESET event
+  if(t==='RESET'){
+    Object.keys(peers).forEach(k=>delete peers[k]);
+    Object.keys(jobs).forEach(k=>delete jobs[k]);
+    Object.keys(vdata).forEach(k=>delete vdata[k]);
+    bids.length=0;
+    tv=0;tc=0;evtCount=0;bidCount=0;
+    document.getElementById('stream-box').innerHTML='';
+    document.getElementById('stat-peers').textContent='0';
+    document.getElementById('stat-jobs').textContent='0';
+    document.getElementById('stat-votes').textContent='0';
+    document.getElementById('stat-consensus').textContent='0';
+    renderAgents();renderJobs();renderVotes();renderBids();drawNetwork();
+    return;
+  }
 
   if(t==='PEER_ANNOUNCE'||t==='HEARTBEAT'){
     peers[sid]={role,status:'online',seen:now};
@@ -1620,6 +1701,9 @@ async function loadResults(){
         ${fixBadge}
       </div>`;
     }).join('');
+    // Auto-select first (most recent) result
+    const first=list.querySelector('.result-item');
+    if(first) first.click();
   }catch(e){
     list.innerHTML='<div style="color:var(--red);padding:12px">Error loading results</div>';
   }
@@ -1653,7 +1737,7 @@ function showPreviewContent(){
   const preview=document.getElementById('result-preview');
   const blob=new Blob([_currentResultHtml],{type:'text/html'});
   const url=URL.createObjectURL(blob);
-  preview.innerHTML=`<iframe src="${url}" class="result-frame" style="flex:1;width:100%"></iframe>`;
+  preview.innerHTML=`<iframe src="${url}" class="result-frame"></iframe>`;
   document.getElementById('btn-preview').classList.add('active');
   document.getElementById('btn-source').classList.remove('active');
 }

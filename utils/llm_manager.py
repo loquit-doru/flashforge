@@ -67,7 +67,7 @@ class LLMResponse:
 
 class LLMManager:
     """Manages multiple LLM providers with fallback logic"""
-    
+
     def __init__(self):
         self.clients: Dict[LLMProvider, Any] = {}
         self._init_clients()
@@ -75,6 +75,16 @@ class LLMManager:
         # Resilience state (borrowed from defi-agent)
         self._cooldowns: Dict[LLMProvider, float] = {}  # provider → cooldown-until timestamp
         self._last_successful: Dict[str, LLMProvider] = {}  # role → last provider that worked
+        # Economy hook — called after every successful LLM call with provider name
+        self._on_llm_spend: Optional[Callable[[str], None]] = None
+
+    def set_spend_hook(self, hook: Callable[[str], None]) -> None:
+        """Register a callback invoked after each successful LLM call.
+
+        The hook receives the provider name (e.g. 'groq', 'gemini') so the
+        caller can deduct credits from the Agent Economy.
+        """
+        self._on_llm_spend = hook
         
     def _init_clients(self):
         """Initialize LLM clients"""
@@ -204,9 +214,9 @@ class LLMManager:
                     except asyncio.TimeoutError:
                         elapsed = time.time() - start_time
                         print(f"  ⏰ {prov.value} timed out after {elapsed:.0f}s")
-                        self._set_cooldown(prov, 30)  # shorter cooldown for timeout
+                        self._set_cooldown(prov, 30)
                         last_error = LLMTimeoutError(f"{prov.value} timed out after {elapsed:.0f}s")
-                        break  # move to next provider
+                        break  # move to next provider (already handled — no re-raise)
                     # ────────────────────────────────────────────────
                     
                     response.generation_time = time.time() - start_time
@@ -231,18 +241,20 @@ class LLMManager:
                     # Success! Cache warm path.
                     self._last_successful[role_key] = prov
                     self._log_request(prov, prompt, response)
+                    # Notify economy hook (agent nodes deduct credits here)
+                    if self._on_llm_spend:
+                        try:
+                            self._on_llm_spend(prov.value)
+                        except Exception:
+                            pass  # economy hook must never break LLM flow
                     return response
                     
-                except asyncio.TimeoutError:
-                    raise  # already handled above
                 except Exception as e:
                     last_error = e
                     err_str = str(e).lower()
-                    # ALWAYS log provider errors (not just in DEBUG)
                     print(f"  ❌ {prov.value} error: {type(e).__name__}: {str(e)[:200]}")
-                    # Rate limit → longer cooldown
                     if '429' in err_str or 'rate' in err_str:
-                        self._set_cooldown(prov, PROVIDER_COOLDOWN_SEC)
+                        self._set_cooldown(prov, 60)  # 60s — avoid hammering after quota exhaustion
                     elif '401' in err_str or 'auth' in err_str:
                         self._set_cooldown(prov, 300)  # 5min for auth errors
                     else:
@@ -396,9 +408,12 @@ class LLMManager:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
         
-        # Inflate max_tokens for Gemini — thinking tokens consume from this
-        # budget, so we need headroom.  Capped at 65536 (Gemini 2.5 Flash max).
-        effective_max = max(max_tokens, self.GEMINI_MAX_TOKENS)
+        # Inflate max_tokens for Gemini thinking models (2.5-*) — thinking tokens
+        # consume from this budget.  Non-thinking models (2.0-*) don't need this.
+        if "2.5" in settings.GEMINI_MODEL:
+            effective_max = max(max_tokens, self.GEMINI_MAX_TOKENS)
+        else:
+            effective_max = min(max_tokens, 8192)  # non-thinking: keep it small & fast
         
         response = await client.chat.completions.create(
             model=settings.GEMINI_MODEL,

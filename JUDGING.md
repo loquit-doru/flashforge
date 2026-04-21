@@ -104,13 +104,13 @@ python swarm/warmup_demo.py
 ```bash
 python swarm/dashboard_server.py
 # → open http://localhost:5050
-# Tabs: Peers, Jobs, Events, PoC, Hive Memory, Agent Economy, Coordination Metrics
+# Tabs: Live (peers + jobs + events), PoC, Hive, Economy, Metrics, Result
 ```
 
 ### Docker (everything in one command)
 ```bash
 cp .env.example .env   # add GROQ_API_KEY
-docker compose up      # foxmq + planner + builder + critic + critic2 + fixer + dashboard
+docker compose up      # 3× foxmq + planner + builder + 4× critic + fixer + dashboard
 # Dashboard: http://localhost:5050
 ```
 
@@ -141,6 +141,8 @@ docker compose up      # foxmq + planner + builder + critic + critic2 + fixer + 
 | AgentEconomy state machine (deterministic scoring) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — `AgentEconomy` |
 | Reputation deltas (+15 delivery, +3 bid won, −10 failure) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — constants |
 | Tier system (novice→standard→veteran→elite) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — `_recalc_tier()` |
+| **Reputation-weighted bidding** — agents with higher reputation get a competitive advantage in bid evaluation | [`swarm/bid_protocol.py`](swarm/bid_protocol.py) — `_reputation_adjusted_score()` |
+| **Credit-based LLM economy** — agents spend credits for LLM calls; cost varies by provider (Groq=1, Gemini=5, Anthropic=20) | [`swarm/agent_economy.py`](swarm/agent_economy.py) — `spend_credits()` |
 | Dashboard economy leaderboard with tier badges | [`swarm/dashboard_server.py`](swarm/dashboard_server.py) — `/api/economy` |
 | Coordination latency metrics (bid, eval, pipeline) | [`swarm/dashboard_server.py`](swarm/dashboard_server.py) — `/api/coordination` |
 

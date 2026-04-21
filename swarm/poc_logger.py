@@ -42,6 +42,10 @@ class PoCLogger:
         secret: str = "swarm-secret-change-in-prod",
         log_dir: str = "./poc_logs",
     ):
+        if not secret:
+            raise ValueError("PoCLogger secret cannot be empty.")
+        if secret == "swarm-secret-change-in-prod":
+            print("[poc_logger] ⚠  WARNING: Using default SWARM_SECRET.")
         self.job_id = job_id
         self._secret = secret.encode()
         self._log_path = Path(log_dir) / f"poc_{job_id}.jsonl"
@@ -53,18 +57,40 @@ class PoCLogger:
     # ── Public API ─────────────────────────────────────────────────────────────
 
     def _resume_from_file(self) -> None:
-        """If the log file already exists, fast-forward seq + chain_hash to its last entry."""
+        """Fast-forward seq + chain_hash to last entry, validating HMAC chain integrity."""
         if not self._log_path.exists():
             return
         last_entry = None
+        prev_chain = ""
+        line_no = 0
         with open(self._log_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        last_entry = json.loads(line)
-                    except json.JSONDecodeError:
-                        pass
+            for raw in f:
+                line_no += 1
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"Corrupted PoC log '{self._log_path}' at line {line_no}: {e}"
+                    )
+                # Verify chain link
+                if entry.get("prev_chain") != prev_chain:
+                    raise ValueError(
+                        f"PoC log chain break at line {line_no} "
+                        f"(seq={entry.get('seq')}): expected prev_chain={prev_chain!r}"
+                    )
+                # Verify HMAC
+                computed = self._sign(entry)
+                stored = entry.get("hmac", "")
+                if not _hmac_mod.compare_digest(computed, stored):
+                    raise ValueError(
+                        f"PoC log HMAC mismatch at line {line_no} "
+                        f"(seq={entry.get('seq')}) — log may be tampered"
+                    )
+                prev_chain = stored
+                last_entry = entry
         if last_entry is not None:
             self._seq = last_entry.get("seq", 0) + 1
             self._chain_hash = last_entry.get("hmac", "")

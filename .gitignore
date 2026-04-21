@@ -95,8 +95,11 @@ agent.log
 .coverage
 retrospective.md
 
-# Tests (internal)
-tests/
+# Tests (internal — exclude all except integration tests)
+tests/*
+!tests/test_bid_determinism.py
+!tests/test_bft_consensus.py
+!tests/test_poc_chain.py
 
 # Seedstr private key (not published)
 seedstr_client.py

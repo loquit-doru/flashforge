@@ -1,5 +1,5 @@
 """
-Planner Agent for BlitzDev
+Planner Agent for FlashForge
 Analyzes prompts and creates implementation plans
 """
 
@@ -134,11 +134,10 @@ class PlannerAgent:
         # Build analysis prompt
         analysis_prompt = self._build_analysis_prompt(prompt, requirements)
         
-        # Get LLM response
-        response = await self.llm.generate(
+        # Get LLM response — use Claude directly (Groq hits 413 TPM limits with system prompts)
+        response = await self.llm.generate_with_quality(
             prompt=analysis_prompt,
-            temperature=settings.TEMPERATURE_PLANNER,
-            system_prompt=self.system_prompt
+            temperature=settings.TEMPERATURE_PLANNER
         )
         
         # Parse response

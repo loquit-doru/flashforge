@@ -1,5 +1,5 @@
 """
-Critic Agent for BlitzDev
+Critic Agent for FlashForge
 Evaluates web applications on functionality, design, and speed
 """
 
@@ -347,10 +347,9 @@ Respond with ONLY valid JSON (no markdown):
 }}"""
         
         try:
-            response = await self.llm.generate(
+            response = await self.llm.generate_with_quality(
                 prompt=eval_prompt,
-                temperature=0.3,
-                provider=LLMProvider.QWEN
+                temperature=0.3
             )
             
             content = response.content

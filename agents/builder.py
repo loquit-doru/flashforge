@@ -1,5 +1,5 @@
 """
-Builder Agent for BlitzDev
+Builder Agent for FlashForge
 Generates complete web applications (HTML/CSS/JS) with Tailwind CSS
 """
 
@@ -68,15 +68,16 @@ class BuilderAgent:
                 DESIGN_PRESETS["modern_minimal"]
             )
             
-            # Dynamic MAX_TOKENS based on complexity (saves 30-40% for simple apps)
+            # Dynamic MAX_TOKENS based on complexity
+            # Capped at 8000 to stay within Groq free-tier rate limits (6000 TPM)
             complexity_tokens = {
-                "simple": 10_000,
-                "medium": 20_000,
-                "complex": settings.MAX_TOKENS,  # full budget
+                "simple": 6_000,
+                "medium": 8_000,
+                "complex": 8_000,
             }
             max_tokens = complexity_tokens.get(
                 plan.complexity.value if hasattr(plan.complexity, 'value') else str(plan.complexity),
-                settings.MAX_TOKENS
+                8_000
             )
             
             # Generate code — use quality LLM (Claude) for best HTML output
@@ -86,7 +87,7 @@ class BuilderAgent:
                 prompt=build_prompt,
                 temperature=settings.TEMPERATURE_BUILDER,
                 max_tokens=max_tokens,
-                min_content_length=10000  # real builds are 19K-23K; 5K was too lenient
+                min_content_length=2000  # lowered: simple prompts (calculator) generate ~3-8K
             )
             
             # Debug: log raw response length and provider
@@ -222,7 +223,8 @@ CALCULATOR-SPECIFIC REQUIREMENTS:
 - Handle edge cases: division by zero, decimal precision, operator chaining
 - Add keyboard input support
 - Include calculation history
-- Add clear/backspace functionality""",
+- Add clear/backspace functionality
+- STYLING: dark background (bg-gray-900/bg-slate-950), large monospace display, rounded buttons with shadow-lg and hover glow effects, grid layout for number pad, vibrant accent color for operators (orange/amber), smooth press animations""",
             "e_commerce": """
 E-COMMERCE-SPECIFIC REQUIREMENTS:
 - Product grid with images, prices, ratings, add-to-cart
@@ -554,7 +556,7 @@ OUTPUT: Return ONLY the raw HTML starting with <!DOCTYPE html>. No markdown fenc
                 for cdn in design_preset.get("cdn", [])
             ])
             
-            html = HTML_TEMPLATE.replace("{{ title }}", "BlitzDev App")\
+            html = HTML_TEMPLATE.replace("{{ title }}", "FlashForge App")\
                                .replace("{{ tailwind_config | safe }}", tailwind_config)\
                                .replace("{% for cdn in cdns %}", "")\
                                .replace("{% endfor %}", "")\

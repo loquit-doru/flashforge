@@ -25,6 +25,7 @@ from swarm.foxmq_node import FoxMQNode
 from swarm.bid_protocol import BidProtocol
 from swarm.poc_logger import PoCLogger
 from swarm.hive_memory import make_hive_payload, HIVE_TOPIC
+from swarm.agent_economy import AgentEconomy
 
 NODE_ID = os.getenv("NODE_ID", f"planner-{uuid.uuid4().hex[:8]}")
 FOXMQ_HOST = os.getenv("FOXMQ_HOST", "127.0.0.1")
@@ -42,8 +43,27 @@ async def main() -> None:
         return min(_active_tasks / 4.0, 1.0)
 
     node = FoxMQNode(NODE_ID, "planner", FOXMQ_HOST, FOXMQ_PORT, SWARM_SECRET)
-    bidder = BidProtocol(node, capability="planning", load_fn=_get_load)
+    economy = AgentEconomy()
+    bidder = BidProtocol(node, capability="planning", load_fn=_get_load, economy=economy)
     planner = PlannerAgent()
+
+    # Economy hook: deduct credits + broadcast LLM_SPENT on every LLM call
+    def _on_llm_spend(provider: str) -> None:
+        economy.spend_credits(NODE_ID, "planner", provider)
+        asyncio.get_event_loop().call_soon(
+            lambda: asyncio.create_task(node.publish("LLM_SPENT", {
+                "agent_id": NODE_ID, "provider": provider,
+            }))
+        )
+    planner.llm.set_spend_hook(_on_llm_spend)
+
+    # Wire economy into MQTT events — every node maintains a local replica
+    for evt in ("COMMIT", "PLAN_READY", "BUILD_COMPLETE", "EVAL_VOTE",
+                "EVAL_CONSENSUS", "FIX_COMPLETE", "LLM_SPENT", "PEER_ANNOUNCE"):
+        node.on(evt, lambda msg, _et=evt: economy.process_swarm_event(
+            _et, msg.get("sender_id", ""), msg.get("sender_role", ""),
+            msg.get("payload", {}),
+        ))
 
     async def on_commit(job_id: str, won: bool, task_payload: dict | None) -> None:
         nonlocal _active_tasks
@@ -66,12 +86,14 @@ async def main() -> None:
                 "components": plan_dict.get("components", [])[:5],
             })
 
-            # Hand off to builder via the swarm
+            # Hand off to builder via the swarm.
+            # next_stage_job_id: if builder dies after commit, re-announce building.
             await bidder.announce_task(
                 prompt=prompt,
                 capability="building",
                 context={"plan": plan_dict},
                 job_id=f"{job_id}:build",
+                next_stage_job_id=f"{job_id}:eval",
             )
 
             # Publish to Hive Memory — share planning context with the swarm

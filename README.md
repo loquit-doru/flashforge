@@ -12,7 +12,7 @@
 
 Every multi-agent system has a dirty secret: a hidden coordinator that, if it dies, takes the whole swarm with it.
 
-FlashForge eliminates that. Six specialized AI agents — Planner, Builder, three Critics, and a Fixer — self-organize entirely through message passing. No master process. No single point of failure. When a node dies mid-job, the swarm detects it via missed heartbeats and reassigns the work automatically.
+FlashForge eliminates that. Seven specialized AI agents — Planner, Builder, four Critics, and a Fixer — self-organize entirely through message passing. No master process. No single point of failure. When a node dies mid-job, the swarm detects it via missed heartbeats and reassigns the work automatically.
 
 ---
 
@@ -92,7 +92,7 @@ PROMPT="Build a weather dashboard with dark theme" docker compose run --rm injec
 │                            │ EVAL_VOTE (3x)              │          │
 │                            ▼                             │          │
 │                   ┌─────────────────┐                   │          │
-│                   │  🔍 Critics (×3) │  BFT Quorum (2/3)│          │
+│                   │  🔍 Critics (×4) │  BFT Quorum (3/4)│          │
 │                   │  (Groq mixtral) │──────────────────┘          │
 │                   └────────┬────────┘                              │
 │                            │ EVAL_CONSENSUS                        │
@@ -106,7 +106,7 @@ PROMPT="Build a weather dashboard with dark theme" docker compose run --rm injec
 **Key design decisions:**
 - **No master orchestrator** — every agent discovers peers via `PEER_ANNOUNCE` + `HEARTBEAT`
 - **Leaderless bidding** — agents compete on `load_score`; FoxMQ/Vertex orders bids deterministically
-- **BFT evaluation** — 3 critics vote independently; consensus requires ≥ 2/3 agreement
+- **BFT evaluation** — 4 critics vote independently; consensus requires ≥ 3/4 (quorum=3, tolerates 1 Byzantine failure)
 - **Verifiable coordination** — every event is HMAC-chained and multi-signed (mini-blockchain)
 - **Hive Memory** — agents share state through FoxMQ, no central database
 
@@ -119,7 +119,7 @@ PROMPT="Build a weather dashboard with dark theme" docker compose run --rm injec
 | ✅ Discover & Form | `PEER_ANNOUNCE` + `HEARTBEAT` — ad-hoc swarms form in < 5 s |
 | ✅ Negotiate & Commit | Leaderless bid auction → deterministic `COMMIT` via Vertex ordering |
 | ✅ Execute & Prove | PoC HMAC hash-chain with multi-agent attestations |
-| ✅ ≥ 3 agents, full loop | Planner → Builder → 3 Critics → Fixer (6 agents) |
+| ✅ ≥ 3 agents, full loop | Planner → Builder → 4 Critics → Fixer (7 agents) |
 | ✅ FoxMQ / Vertex | All coordination over MQTT 5.0 → 3-node FoxMQ cluster → Vertex BFT |
 | ✅ Hive Memory | Decentralized shared state — no central DB, TTL + FIFO eviction |
 | ✅ Agent Economy | Reputation + credits tracked per agent; tiers novice→elite |
@@ -257,7 +257,7 @@ Tiers: **Novice** (0–99) → **Standard** (100–199) → **Veteran** (200–2
 |-------|-----|----------------|
 | 🧠 **Planner** | Groq (llama-3.3-70b) | Decomposes prompt → `ImplementationPlan` |
 | 🏗 **Builder** | Gemini 2.0 Flash | Generates full application code |
-| 🔍 **Critic** (×3) | Groq (mixtral-8x7b) | Scores output: functionality, design, speed |
+| 🔍 **Critic** (×4) | Groq (mixtral-8x7b) | Scores output: functionality, design, speed |
 | 🔧 **Fixer** | Qwen (free tier) | Patches code when consensus score < threshold |
 
 All agents are **interchangeable** — multiple instances bid on each task; the lowest-load node wins.
@@ -312,9 +312,10 @@ pip install -r requirements.txt
 # Terminals 3-8 — Start agents
 python swarm/run_planner_node.py
 python swarm/run_builder_node.py
-CRITICS_EXPECTED=3 python swarm/run_critic_node.py
-CRITICS_EXPECTED=3 NODE_ID=critic-002 python swarm/run_critic_node.py
-CRITICS_EXPECTED=3 NODE_ID=critic-003 python swarm/run_critic_node.py
+CRITICS_EXPECTED=4 python swarm/run_critic_node.py
+CRITICS_EXPECTED=4 NODE_ID=critic-002 python swarm/run_critic_node.py
+CRITICS_EXPECTED=4 NODE_ID=critic-003 python swarm/run_critic_node.py
+CRITICS_EXPECTED=4 NODE_ID=critic-004 python swarm/run_critic_node.py
 python swarm/run_fixer_node.py
 
 # Terminal 9 — Dashboard
@@ -348,7 +349,7 @@ flashforge/
 ├── agents/                  # LLM agent implementations
 ├── utils/llm_manager.py     # Multi-provider LLM router (Groq → Gemini → Qwen → Anthropic)
 ├── config.py
-├── docker-compose.yml       # Full stack (3 FoxMQ brokers + 6 agents + dashboard)
+├── docker-compose.yml       # Full stack (3 FoxMQ brokers + 7 agents + dashboard)
 └── .env.example
 
 demo_resilience.py           # Node failure demo (kill any role live)

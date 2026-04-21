@@ -96,19 +96,23 @@ async def main(prompt: str, timeout_s: int) -> None:
     print(f"\n🚀 Injecting task ({online} peers online)…\n")
     start_ts = time.time()
 
-    # Inject the planning task
+    # Inject the planning task.
+    # next_stage_job_id: if planner dies after commit, re-announce planning.
     await bidder.announce_task(
         prompt=prompt,
         capability="planning",
         job_id=job_id,
+        next_stage_job_id=f"{job_id}:build",
     )
 
     # Wait for completion (detected by COORDINATION_COMPLETE in PoC log)
     poc_path = f"{POC_LOG_DIR}/poc_{job_id}.jsonl"
     deadline = start_ts + timeout_s
+    poll_wait = 2.0  # start with 2s, back off to 15s max
 
     while time.time() < deadline:
-        await asyncio.sleep(3)
+        await asyncio.sleep(poll_wait)
+        poll_wait = min(poll_wait * 1.5, 15.0)  # exponential backoff
         # Check if PoC log has been finalized
         try:
             if os.path.exists(poc_path):

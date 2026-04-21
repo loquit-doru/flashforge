@@ -25,6 +25,7 @@ This module is used by:
 import hashlib
 import hmac as _hmac
 import json
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field, asdict
@@ -78,6 +79,7 @@ class HiveMemory:
     def __init__(self, max_entries: int = MAX_ENTRIES):
         self._store: OrderedDict[str, HiveEntry] = OrderedDict()
         self._max = max_entries
+        self._lock = threading.Lock()
         self._stats = {
             "writes": 0,
             "reads": 0,
@@ -90,15 +92,14 @@ class HiveMemory:
     def put(self, entry: HiveEntry) -> None:
         """Insert or update an entry in the hive."""
         fk = entry.full_key
-        if fk in self._store:
-            del self._store[fk]
-        self._store[fk] = entry
-        self._stats["writes"] += 1
-
-        # FIFO eviction if over capacity
-        while len(self._store) > self._max:
-            evicted_key, _ = self._store.popitem(last=False)
-            self._stats["evictions"] += 1
+        with self._lock:
+            if fk in self._store:
+                del self._store[fk]
+            self._store[fk] = entry
+            self._stats["writes"] += 1
+            while len(self._store) > self._max:
+                self._store.popitem(last=False)
+                self._stats["evictions"] += 1
 
     def put_from_payload(self, payload: Dict[str, Any]) -> HiveEntry:
         """Create and store an entry from an MQTT payload dict."""
@@ -111,54 +112,58 @@ class HiveMemory:
     def get(self, namespace: str, key: str) -> Optional[HiveEntry]:
         """Get a single entry by namespace:key."""
         fk = f"{namespace}:{key}"
-        entry = self._store.get(fk)
-        if entry and entry.is_expired:
-            del self._store[fk]
-            self._stats["expired"] += 1
-            return None
-        if entry:
-            self._stats["reads"] += 1
+        with self._lock:
+            entry = self._store.get(fk)
+            if entry and entry.is_expired:
+                del self._store[fk]
+                self._stats["expired"] += 1
+                return None
+            if entry:
+                self._stats["reads"] += 1
         return entry
 
     def query(self, namespace: str = "", job_id: str = "") -> List[HiveEntry]:
         """Query entries by namespace and/or job_id. Filters expired."""
-        self._gc()
-        self._stats["reads"] += 1
-        results = []
-        for entry in self._store.values():
-            if namespace and entry.namespace != namespace:
-                continue
-            if job_id and entry.job_id != job_id:
-                continue
-            results.append(entry)
+        with self._lock:
+            self._gc()
+            self._stats["reads"] += 1
+            results = [
+                e for e in self._store.values()
+                if (not namespace or e.namespace == namespace)
+                and (not job_id or e.job_id == job_id)
+            ]
         return results
 
     def get_all(self) -> List[HiveEntry]:
         """Return all non-expired entries."""
-        self._gc()
-        return list(self._store.values())
+        with self._lock:
+            self._gc()
+            return list(self._store.values())
 
     # ── Stats ──────────────────────────────────────────────────────────────────
 
     @property
     def size(self) -> int:
-        return len(self._store)
+        with self._lock:
+            return len(self._store)
 
     @property
     def stats(self) -> dict:
-        return {**self._stats, "size": self.size}
+        with self._lock:
+            return {**self._stats, "size": len(self._store)}
 
     def namespace_counts(self) -> Dict[str, int]:
         """Count entries per namespace."""
-        counts: Dict[str, int] = {}
-        for entry in self._store.values():
-            counts[entry.namespace] = counts.get(entry.namespace, 0) + 1
+        with self._lock:
+            counts: Dict[str, int] = {}
+            for entry in self._store.values():
+                counts[entry.namespace] = counts.get(entry.namespace, 0) + 1
         return counts
 
     # ── GC ─────────────────────────────────────────────────────────────────────
 
     def _gc(self) -> None:
-        """Remove expired entries."""
+        """Remove expired entries. Caller must hold self._lock."""
         now_ms = int(time.time() * 1000)
         expired = [k for k, e in self._store.items() if now_ms > e.expires_ms]
         for k in expired:
@@ -169,13 +174,18 @@ class HiveMemory:
 
     def snapshot(self) -> Dict[str, Any]:
         """Full snapshot for the dashboard API."""
-        self._gc()
-        entries = [e.to_dict() for e in self._store.values()]
+        with self._lock:
+            self._gc()
+            entries = [e.to_dict() for e in self._store.values()]
+            counts: Dict[str, int] = {}
+            for e in self._store.values():
+                counts[e.namespace] = counts.get(e.namespace, 0) + 1
+            stats = {**self._stats, "size": len(self._store)}
         return {
             "entries": entries,
             "total": len(entries),
-            "namespaces": self.namespace_counts(),
-            "stats": self.stats,
+            "namespaces": counts,
+            "stats": stats,
         }
 
 
