@@ -57,7 +57,7 @@ python swarm/verify_poc.py poc_logs/poc_<job_id>.jsonl
 |------|-------|
 | Every MQTT message HMAC-SHA256 signed before publish | [`swarm/foxmq_node.py`](swarm/foxmq_node.py) — `_sign()` / `publish()` |
 | HMAC verified on every received message | [`swarm/foxmq_node.py`](swarm/foxmq_node.py) — `_verify()` in `_dispatch()` |
-| Nonce ring-buffer (1024 entries) prevents replay attacks | [`swarm/foxmq_node.py`](swarm/foxmq_node.py) — `_seen_nonces` |
+| Nonce ring-buffer (10,000 entries) prevents replay attacks | [`swarm/foxmq_node.py`](swarm/foxmq_node.py) — `_seen_nonces` |
 | FoxMQ Vertex BFT consensus — mathematically fair message ordering | [FoxMQ docs](https://github.com/tashigit/foxmq-legacy) |
 | Canonical JSON (sorted keys) for deterministic HMAC | [`swarm/foxmq_node.py`](swarm/foxmq_node.py) — `_sign()` |
 

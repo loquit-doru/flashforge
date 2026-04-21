@@ -1,7 +1,7 @@
 # FlashForge — DoraHacks BUIDL Submission
 
 > **Vertex Swarm Challenge 2026 · Track 3: Agent Economy**
-> Deadline: April 6, 2026
+> Deadline: April 22, 2026
 
 ---
 
@@ -61,7 +61,7 @@ A user submits a natural-language prompt (e.g., *"Build a todo list app with dar
 | ✅ Auditability | Standalone `verify_poc.py` verifier, no FoxMQ needed |
 | ✅ Developer clarity | One-command Docker Compose, live dashboard at :5050 |
 | ✅ Hive Memory | Decentralized shared state — agents publish plan/build/eval/fix context to `swarm/HIVE_MEMORY`, no central DB |
-| ✅ Agent Economy | Reputation + credits tracked per agent; tiers (novice→elite), **reputation-weighted bidding**, **credit-based LLM spending** (Groq=1, Gemini=5, Anthropic=20) |
+| ✅ Agent Economy | Reputation + credits tracked per agent; tiers (novice→elite), **reputation-weighted bidding**, **credit-based LLM spending** (Groq=1, Qwen=2, Gemini=5, Anthropic=20) |
 | ✅ Coordination Metrics | Real-time latency tracking (bid, eval, pipeline), overhead analysis in dashboard |
 
 ---

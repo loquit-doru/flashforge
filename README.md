@@ -54,7 +54,7 @@ git clone https://github.com/loquit-doru/flashforge && cd flashforge
 cp .env.example .env
 echo "GROQ_API_KEY=your-key-here" >> .env
 
-# 3. Start the full swarm (3 FoxMQ brokers + 6 agents + dashboard)
+# 3. Start the full swarm (3 FoxMQ brokers + 7 agents + dashboard)
 docker compose up --build
 
 # 4. Inject a job (new terminal)
@@ -366,10 +366,10 @@ JUDGING.md                   # Judging criteria → code file mapping
 2. **Real resilience** — `demo_resilience.py` kills nodes live and proves recovery
 3. **Cryptographic audit trail** — HMAC hash-chained PoC with multi-agent attestations
 4. **Double replay protection** — HMAC + nonce ring + TTL (belt and suspenders)
-5. **Production observability** — 7-tab live dashboard: topology, BFT votes, PoC, Hive Memory, Economy, Metrics
+5. **Production observability** — 6-tab live dashboard: Live (peers + jobs + events), PoC, Hive Memory, Economy, Metrics, Result
 6. **Agent Economy** — emergent reputation market with deterministic scoring from MQTT events
 7. **Multi-LLM cost optimization** — routes to cheapest capable model per task type
-8. **One-command Docker** — full 3-broker cluster + 6 agents in `docker compose up`
+8. **One-command Docker** — full 3-broker cluster + 7 agents in `docker compose up`
 
 ---
 
